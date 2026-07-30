@@ -122,7 +122,7 @@ def _run_sfpu_binary_llk_golden(
     perf_report=None,
     dst_rounding_mode=DstRoundingMode.Default,
 ):
-    """Shared driver for the unpack-to-dest, LLK-golden binary SFPU ops.
+    """Shared driver for the LLK-golden binary SFPU ops.
 
     ``prepare_stimuli(formats, input_dimensions, src0_idx, src1_idx, mathop)``
     returns ``(src_A, tile_cnt_A, src_B)``; both operands live in ``src_A`` at
@@ -132,6 +132,10 @@ def _run_sfpu_binary_llk_golden(
     src0_idx, src1_idx, dst_idx = tile_indices
     input_dimensions = [(max(src0_idx, src1_idx, dst_idx) + 1) * 32, 32]
     num_faces = MAX_NUM_FACES
+
+    unpack_to_dest = formats.input_format.is_32_bit() == (
+        dest_acc == DestAccumulation.Yes
+    )
 
     src_A, tile_cnt_A, src_B = prepare_stimuli(
         formats, input_dimensions, src0_idx, src1_idx, mathop
@@ -164,7 +168,9 @@ def _run_sfpu_binary_llk_golden(
             SFPU_BINARY_OP(binary_op),
             IMPLIED_MATH_FORMAT(implied_math_format),
             DATA_COPY_TYPE(DataCopyType.A2D),
-            UNPACKER_ENGINE_SEL(UnpackerEngine.UnpDest),
+            UNPACKER_ENGINE_SEL(
+                UnpackerEngine.UnpDest if unpack_to_dest else UnpackerEngine.UnpA
+            ),
             DEST_SYNC(),
             # 2's-complement datapath (default); only the quant family reads this.
             SIGN_MAGNITUDE_FORMAT(False),
@@ -195,7 +201,7 @@ def _run_sfpu_binary_llk_golden(
             num_faces=num_faces,
             twos_complement=formats.input_format.is_integer(),
         ),
-        "unpack_to_dest": True,
+        "unpack_to_dest": unpack_to_dest,
         "dest_acc": dest_acc,
     }
 
@@ -316,7 +322,9 @@ def _get_valid_float_formats_dest_acc():
     )
     return [
         (fmt, dest_acc)
-        for fmt, dest_acc in generate_sfpu_format_dest_acc_combinations(formats)
+        for fmt, dest_acc in generate_sfpu_format_dest_acc_combinations(
+            formats, unpack_to_dest=True
+        )
         if not (
             fmt.input_format == DataFormat.Float16 and dest_acc == DestAccumulation.Yes
         )
@@ -519,6 +527,12 @@ def prepare_binary_max_min_inputs(src_A, src_B, input_format, output_format):
     return in0, in1
 
 
+def _max_min_unpack_to_dest(fmt: FormatConfig, dest_acc: DestAccumulation) -> bool:
+    """UNPACK→DEST is selected only for a 32-bit input with a 32-bit Dest; every other
+    max/min variant goes UNPACK -> SrcA -> FPU datacopy -> Dest."""
+    return fmt.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
+
+
 def _generate_max_min_combinations(
     formats_list: List[FormatConfig],
     dest_acc_for_format,
@@ -529,7 +543,9 @@ def _generate_max_min_combinations(
     combinations = []
     for fmt in formats_list:
         for dest_acc in dest_acc_for_format(fmt):
-            if is_invalid_quasar_sfpu_format_combination(fmt, dest_acc):
+            if is_invalid_quasar_sfpu_format_combination(
+                fmt, dest_acc, _max_min_unpack_to_dest(fmt, dest_acc)
+            ):
                 continue
             for implied_math_format in implied_math_formats:
                 if implied_math_format not in _get_valid_implied_math_formats(fmt):
@@ -626,9 +642,7 @@ def _run_max_min(
         buffer_B_dummy = in1
         disable_format_inference = formats.input_format.is_mx_format()
 
-    unpack_to_dest = (
-        formats.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-    )
+    unpack_to_dest = _max_min_unpack_to_dest(formats, dest_acc)
 
     if is_perf and perf_report is None:
         raise ValueError("perf_report must be provided when is_perf=True")
