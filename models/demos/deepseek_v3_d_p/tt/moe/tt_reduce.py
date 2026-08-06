@@ -81,8 +81,17 @@ class TtReduceModule(LightweightModule):
             output: Per-chip tensor of shape [seq_len, emb_dim / num_chips_in_axis]
         """
         if weights is not None:
-            # Ensure weights has trailing dim=1 for broadcast: [..., topk] -> [..., topk, 1]
-            if weights.shape[-1] != 1:
+            # Scores can omit leading mesh dimensions. For topk=1 a trailing
+            # singleton is ambiguous, so select the interpretation whose
+            # non-embedding dimensions match combine_output rather than using
+            # `weights.shape[-1] == 1` as a proxy for an existing broadcast
+            # dimension.
+            if len(weights.shape) < len(combine_output.shape):
+                missing_leading_dims = len(combine_output.shape) - len(weights.shape)
+                padded_weight_shape = (1,) * missing_leading_dims + tuple(weights.shape)
+                if tuple(combine_output.shape)[:-1] != padded_weight_shape:
+                    weights = ttnn.unsqueeze(weights, dim=-1)
+            elif weights.shape[-1] != 1:
                 weights = ttnn.unsqueeze(weights, dim=-1)
 
             # Add batch dimensions if needed to match combine_output rank
