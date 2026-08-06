@@ -2,6 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+// A Metal 2.0 port of this kernel lives beside it as eltwise_copy_metal2.cpp, for factories that build a
+// ProgramSpec. This legacy copy remains for factories still on the positional-argument API; keep the two
+// in sync until the last of those is migrated, at which point this file can be deleted.
+
 #include <cstdint>
 
 #include "api/compute/common.h"

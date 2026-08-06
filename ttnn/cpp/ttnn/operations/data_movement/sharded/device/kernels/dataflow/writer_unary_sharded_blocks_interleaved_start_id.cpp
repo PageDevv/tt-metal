@@ -2,6 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+// A Metal 2.0 port of this kernel lives beside it as
+// writer_unary_sharded_blocks_interleaved_start_id_metal2.cpp, for factories that build a ProgramSpec.
+// This legacy copy remains for factories still on the positional-argument API; keep the two in sync
+// until the last of those is migrated, at which point this file can be deleted.
+
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
