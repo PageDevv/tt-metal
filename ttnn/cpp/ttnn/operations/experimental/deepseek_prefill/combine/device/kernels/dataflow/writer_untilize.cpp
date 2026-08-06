@@ -342,5 +342,13 @@ void kernel_main() {
     Semaphore<> sender_data_ready_sem(data_ready_semaphore_id);
     sender_data_ready_sem.up(noc, sender_noc_x, sender_noc_y, 1);
     noc.async_atomic_barrier();
+
+    // The non-local row path uses the transaction-id write API to keep its row
+    // transfers separate from the metadata traffic.  Draining that transaction
+    // id is not enough: the API leaves the write command buffer tagged with the
+    // last id.  Restore the normal untagged state before returning so the
+    // firmware's dynamic-NoC handoff check sees an idle command buffer.
+    noc_async_write_set_trid(0);
+
     cb_experts_tok_counter.pop_front(cb_counter_total_pages);
 }
