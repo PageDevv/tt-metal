@@ -399,6 +399,31 @@ class ttMLA:
                 layout=ttnn.TILE_LAYOUT,
             )
 
+        # GLM-5.2 has 64 heads, so TP=4 leaves only 16 heads per chip, below sparse_sdpa's
+        # 32-head minimum. Sparse MLA temporarily exchanges the TP head sharding for sequence
+        # sharding around sparse_sdpa. Allocate the two exact per-device results once here; the
+        # all-to-all calls in forward reuse these stable buffers and never allocate.
+        self._sparse_head_to_seq_output = None
+        self._sparse_seq_to_head_output = None
+        if self._has_indexer and not self.kv_only and self._needs_head_to_seq_reshard:
+            assert self.active_seq_len_local % self.tp_factor == 0, (
+                f"local active sequence length ({self.active_seq_len_local}) must be divisible by TP factor "
+                f"({self.tp_factor}) for sparse MLA head-to-sequence reshard"
+            )
+            self._sparse_head_to_seq_output = self.tt_ccl.get_mla_all_to_all_buffer(
+                name="sparse_mla_head_to_seq",
+                shape=[
+                    1,
+                    self.num_heads,
+                    self.active_seq_len_local // self.tp_factor,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ],
+            )
+            self._sparse_seq_to_head_output = self.tt_ccl.get_mla_all_to_all_buffer(
+                name="sparse_mla_seq_to_head",
+                shape=[1, self.num_heads // self.tp_factor, self.active_seq_len_local, self.kv_lora_rank],
+            )
+
         # Per-axis CCL topology, named symmetrically by axis. The q/kv/wo collectives run on the TP
         # axis (cluster_axis=tp_axis) and use tp_ccl_topology; the ring-attention SDPA (ring_mla /
         # ring_joint_sdpa) runs on the SP axis (cluster_axis=sp_axis) and MUST use sp_ccl_topology.
@@ -1501,18 +1526,20 @@ class ttMLA:
 
         q_seq_sharded = q
         if transpose_head_to_seq:
+            assert self._sparse_head_to_seq_output is not None
             q_seq_sharded = ttnn.experimental.all_to_all_async_generic(
                 q,
                 in_dim=1,
                 out_dim=2,
+                persistent_output_buffer=self._sparse_head_to_seq_output,
                 num_links=self.ccl_num_links,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 cluster_axis=self.tp_axis,
             )  # [1,H,S/(sp·tp),576] — FABRIC_2D path selected at runtime; topology resolves to Linear
 
         q_rm = ttnn.to_layout(q_seq_sharded, ttnn.ROW_MAJOR_LAYOUT)  # the op is ROW_MAJOR-only; q comes in TILE
-        if q_seq_sharded is not q:
-            ttnn.deallocate(q_seq_sharded)
+        # The all-to-all result aliases model-owned scratch. It is intentionally retained for the
+        # next layer instead of deallocated after the layout conversion.
 
         # indices must match q_rm's seq sharding. Incoming is replicated full-glob [1,1,S_global,k] or
         # SP-sharded [1,1,S/sp,k]; under reshard the row count must drop to S/(sp·tp), so split over TP.
@@ -1550,15 +1577,18 @@ class ttMLA:
         if transpose_head_to_seq:
             # Invert the redistribution so the result matches the head-sharded
             # [1, H/tp, S/sp, v_dim] consumed by the epilogue.
+            assert self._sparse_seq_to_head_output is not None
             head_sharded = ttnn.experimental.all_to_all_async_generic(
                 ret,
                 in_dim=2,
                 out_dim=1,
+                persistent_output_buffer=self._sparse_seq_to_head_output,
                 num_links=self.ccl_num_links,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 cluster_axis=self.tp_axis,
             )
             ttnn.deallocate(ret)
+            # Model-owned persistent scratch: the epilogue may read it but must not deallocate it.
             ret = head_sharded
         return ret
 

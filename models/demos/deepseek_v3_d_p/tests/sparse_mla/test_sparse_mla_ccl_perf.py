@@ -25,7 +25,12 @@ from loguru import logger
 import ttnn
 from models.demos.deepseek_v3_d_p.reference.glm_5_1_config import glm_hf_config
 from models.demos.deepseek_v3_d_p.tests.sparse_mla.sparse_mla_mesh import detect_num_devices
-from models.demos.deepseek_v3_d_p.tests.sparse_mla.test_sparse_mla_perf import CHUNK_TOKENS, GALAXY_SP, SCENARIOS
+from models.demos.deepseek_v3_d_p.tests.sparse_mla.test_sparse_mla_perf import (
+    CHUNK_TOKENS,
+    GALAXY_SP,
+    GALAXY_TP,
+    SCENARIOS,
+)
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import create_fabric_router_config, get_max_payload_size
 from tests.tt_eager.python_api_testing.sweep_tests.comparison_funcs import comp_equal
 from tests.ttnn.profiling.realtime_profiler_utils import profile_realtime_program
@@ -41,7 +46,7 @@ NUM_LINKS = 2
 # Per-direction fabric link bandwidth, Gbps. Blackhole-only; sourced from external hardware docs (not
 # in-repo). Override with MLA_CCL_LINK_GBPS_PER_DIRECTION for what-if analysis.
 _GALAXY_LINK_GBPS_PER_DIRECTION = 200.0
-_LOUDBOX_LINK_GBPS_PER_DIRECTION = 400.0
+_LOUDBOX_LINK_GBPS_PER_DIRECTION = 200.0
 
 
 # --------------------------------------------------------------------------------------------------
@@ -66,9 +71,15 @@ class Workload:
 class CCLTraffic:
     """Topology-aware fabric roofline for one collective."""
 
-    # Bytes crossing the busiest link in one direction. This sets the collective latency, so theoretical
-    # time and measured bandwidth use it rather than aggregate network traffic.
+    # Bytes crossing the busiest fabric edge in its busiest direction. This sets latency because each direction
+    # has an independent bandwidth limit.
     critical_path_bytes: float
+    # Actual bytes crossing both directions of that same physical cut. This supports the same aggregate-ingress
+    # bandwidth convention used for bidirectional all-gather without hiding an imbalanced route.
+    aggregate_cut_bytes: float
+    # Mean bidirectional traffic per physical cut. Comparing this with aggregate_cut_bytes exposes routing hot
+    # spots independently of link utilization.
+    average_cut_bytes: float
     # Bytes moved across every fabric link, including forwarding hops. This is aggregate work for context,
     # not a latency term.
     total_network_bytes: float
@@ -78,16 +89,24 @@ class CCLTraffic:
     topology: object
 
     @property
-    def roofline_gigabits_per_second(self) -> float:
-        return self.link_gigabits_per_second_per_direction * self.num_links * self.sustained_directions
+    def directed_roofline_gigabits_per_second(self) -> float:
+        return self.link_gigabits_per_second_per_direction * self.num_links
 
     @property
-    def roofline_gigabytes_per_second(self) -> float:
-        return self.roofline_gigabits_per_second / 8
+    def directed_roofline_gigabytes_per_second(self) -> float:
+        return self.directed_roofline_gigabits_per_second / 8
+
+    @property
+    def aggregate_roofline_gigabytes_per_second(self) -> float:
+        return self.directed_roofline_gigabytes_per_second * self.sustained_directions
 
     @property
     def theoretical_ns(self) -> float:
-        return self.critical_path_bytes / self.roofline_gigabytes_per_second  # bytes / (GB/s) = ns
+        return self.critical_path_bytes / self.directed_roofline_gigabytes_per_second  # bytes / (GB/s) = ns
+
+    @property
+    def network_average_roofline_gigabytes_per_second(self) -> float:
+        return self.average_cut_bytes / self.theoretical_ns
 
 
 @dataclass(frozen=True)
@@ -248,23 +267,57 @@ GLM_SEQUENCE_TO_HEAD = CollectivePath(
 # --------------------------------------------------------------------------------------------------
 # System resolution
 # --------------------------------------------------------------------------------------------------
-def ccl_mesh_param(collective_axis: int):
-    """`pytest.param(mesh_shape, device_params, marks, id)` for the box + collective axis (collection time).
+def ccl_mesh_param(
+    collective_axis: int,
+    *,
+    fabric_config=ttnn.FabricConfig.FABRIC_2D,
+    expected_topology=ttnn.Topology.Linear,
+    require_galaxy: bool = False,
+    require_loudbox_ring: bool = False,
+    max_payload_size: Optional[int] = None,
+):
+    """`pytest.param(mesh_shape, device_params, topology, marks, id)` for one physical fabric setup.
 
     Galaxy (32): the production 8x4. LoudBox (8): an SP=8 line proxy (one line of 8 mirrors a Galaxy SP
-    row) for SP collectives, or a 2x4 mesh preserving TP=4 for TP collectives.
+    row), a 2x4 mesh preserving TP=4 for linear TP collectives, or a native 1x8 ring bandwidth proxy.
     """
     num_devices = detect_num_devices()
     canonical_fabric = {  # matches the deepseek conftest FABRIC_2D params (fabric router + reliability mode)
-        "fabric_router_config": create_fabric_router_config(max_payload_size=get_max_payload_size()),
+        "fabric_router_config": create_fabric_router_config(
+            max_payload_size=get_max_payload_size() if max_payload_size is None else max_payload_size
+        ),
         "reliability_mode": ttnn.FabricReliabilityMode.RELAXED_INIT,
     }
-    fabric_2d = {"trace_region_size": 100000, "fabric_config": ttnn.FabricConfig.FABRIC_2D, **canonical_fabric}
+    fabric_2d = {"trace_region_size": 100000, "fabric_config": fabric_config, **canonical_fabric}
     if num_devices == 32:
+        if require_loudbox_ring:
+            return pytest.param(
+                (1, 1),
+                fabric_2d,
+                expected_topology,
+                marks=pytest.mark.skip(reason="native 1x8 ring proxy runs on LoudBox only"),
+                id="loudbox-only-ring-proxy",
+            )
         system, mesh_shape, mesh_topology, device_params = "galaxy", (8, 4), "mesh-8x4", fabric_2d
     elif num_devices == 8:
+        if require_galaxy:
+            reason = f"{fabric_config} TP/X wrap requires the complete physical 8x4 Galaxy"
+            return pytest.param(
+                (1, 1),
+                fabric_2d,
+                expected_topology,
+                marks=pytest.mark.skip(reason=reason),
+                id="galaxy-only-torus-x",
+            )
         system = "loudbox_proxy"
-        if collective_axis == SP_AXIS:
+        if require_loudbox_ring:
+            mesh_shape, mesh_topology = (1, 8), "ring"
+            device_params = {
+                "trace_region_size": 100000,
+                "fabric_config": ttnn.FabricConfig.FABRIC_1D_RING,
+                "fabric_router_config": canonical_fabric["fabric_router_config"],
+            }
+        elif collective_axis == SP_AXIS:
             # SP=8 line proxy for a Galaxy SP row. Production runs the SP all-gather on Topology.Linear
             # (mla.py:259), so the proxy mirrors that with a FABRIC_1D line — not a ring, which would model a
             # transport Galaxy does not use today. FABRIC_1D isolates the single axis, so it omits the 2D
@@ -275,13 +328,21 @@ def ccl_mesh_param(collective_axis: int):
             mesh_shape, mesh_topology, device_params = (2, 4), "mesh-2x4", fabric_2d
     else:
         reason = f"CCL perf supports Galaxy (32 chips) or LoudBox (8), found {num_devices}"
-        return pytest.param((1, 1), fabric_2d, marks=pytest.mark.skip(reason=reason), id="unsupported")
+        return pytest.param(
+            (1, 1),
+            fabric_2d,
+            expected_topology,
+            marks=pytest.mark.skip(reason=reason),
+            id="unsupported",
+        )
 
+    payload_id = "" if max_payload_size is None else f"_payload{max_payload_size}"
     return pytest.param(
         mesh_shape,
         device_params,
+        expected_topology,
         marks=pytest.mark.requires_mesh_topology(mesh_shape=mesh_shape, topology=mesh_topology),
-        id=f"{system}_sp{mesh_shape[0]}_tp{mesh_shape[1]}",
+        id=f"{system}_sp{mesh_shape[0]}_tp{mesh_shape[1]}_{device_params['fabric_config'].name.lower()}{payload_id}",
     )
 
 
@@ -326,14 +387,38 @@ def _tensor_description(tensor):
     return f"{list(local_tensor.shape)} ({local_tensor.dtype}, {local_tensor.layout}, {local_tensor.memory_config()})"
 
 
+def _resolved_1d_topology(tensor, cluster_axis):
+    """Mirror the Mesh->Linear / Torus->Ring conversion performed by all_to_all_async_generic."""
+    topology = ttnn.get_usable_topology(tensor, cluster_axis=cluster_axis)
+    if topology == ttnn.Topology.Mesh:
+        return ttnn.Topology.Linear
+    if topology == ttnn.Topology.Torus:
+        return ttnn.Topology.Ring
+    return topology
+
+
 # --------------------------------------------------------------------------------------------------
 # Collective execution
 # --------------------------------------------------------------------------------------------------
-def run_collective(mesh_device, path: CollectivePath, workload: Workload, system: RuntimeSystem) -> Measurement:
+def run_collective(
+    mesh_device,
+    path: CollectivePath,
+    workload: Workload,
+    system: RuntimeSystem,
+    input_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    output_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+) -> Measurement:
     """Build the input, profile the collective, and (for reshards) prove it moved data losslessly."""
     if path.partition_dim is None:
         return _run_all_gather(mesh_device, path, workload, system)
-    return _run_reshard(mesh_device, path, workload, system)
+    return _run_reshard(
+        mesh_device,
+        path,
+        workload,
+        system,
+        input_memory_config=input_memory_config,
+        output_memory_config=output_memory_config,
+    )
 
 
 def _gathered_placements(input_placements, gather_dim, cluster_axis):
@@ -382,7 +467,7 @@ def _run_all_gather(mesh_device, path, workload, system) -> Measurement:
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         mesh_mapper=mesh_mapper,
     )
-    usable_topology = ttnn.get_usable_topology(tt_input, system.topology, path.collective_axis)
+    usable_topology = _resolved_1d_topology(tt_input, path.collective_axis)
     assert usable_topology == system.topology, (
         f"{path.name}: requested {system.topology} on cluster_axis={path.collective_axis}, "
         f"but Fabric resolved {usable_topology}"
@@ -407,7 +492,7 @@ def _run_all_gather(mesh_device, path, workload, system) -> Measurement:
     return measurement
 
 
-def _reshard(tt_input, output_buffer, path, system):
+def _reshard(tt_input, output_buffer, path, system, output_memory_config):
     """Run the all-to-all used by sparse MLA to exchange sharded tensor dimensions."""
     return ttnn.experimental.all_to_all_async_generic(
         tt_input,
@@ -415,13 +500,12 @@ def _reshard(tt_input, output_buffer, path, system):
         out_dim=path.partition_dim,
         persistent_output_buffer=output_buffer,
         num_links=system.num_links,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        topology=system.topology,
+        memory_config=output_memory_config,
         cluster_axis=path.collective_axis,
     )
 
 
-def _build_reshard_input(mesh_device, path, torch_input, system):
+def _build_reshard_input(mesh_device, path, torch_input, system, input_memory_config):
     input_dims = [placement.dim for placement in path.input_placements]
     # Distinct shard dims can be constructed directly by the host mesh mapper.
     if len(set(input_dims)) == len(input_dims):
@@ -433,7 +517,7 @@ def _build_reshard_input(mesh_device, path, torch_input, system):
             device=mesh_device,
             layout=path.layout,
             dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=input_memory_config,
             mesh_mapper=mapper,
         )
 
@@ -457,9 +541,8 @@ def _build_reshard_input(mesh_device, path, torch_input, system):
         in_dim=path.output_placements[cax].dim,
         out_dim=path.input_placements[cax].dim,
         num_links=system.num_links,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        memory_config=input_memory_config,
         cluster_axis=cax,
-        topology=system.topology,
     )
     ttnn.synchronize_device(mesh_device)
     ttnn.deallocate(source)
@@ -478,11 +561,23 @@ def _assert_reshard_lossless(tt_output, torch_input, path, sp, tp):
     assert equal, message
 
 
-def _run_reshard(mesh_device, path, workload, system) -> Measurement:
+def _run_reshard(
+    mesh_device,
+    path,
+    workload,
+    system,
+    input_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    output_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+) -> Measurement:
     sp, tp = mesh_device.shape
     mesh_shape = tuple(mesh_device.shape)
     torch_input = torch.rand(path.logical_shape(workload, mesh_shape), dtype=torch.bfloat16)
-    tt_input = _build_reshard_input(mesh_device, path, torch_input, system)
+    tt_input = _build_reshard_input(mesh_device, path, torch_input, system, input_memory_config)
+    usable_topology = _resolved_1d_topology(tt_input, path.collective_axis)
+    assert usable_topology == system.topology, (
+        f"{path.name}: expected {system.topology} on cluster_axis={path.collective_axis}, "
+        f"but Fabric resolved {usable_topology}"
+    )
     # Input shape is shared with the traffic roofline; output shape remains an explicit reshard assertion.
     assert list(ttnn.get_device_tensors(tt_input)[0].shape) == path.local_input_shape(workload, mesh_shape)
     # Match MLA: preallocate the exact per-device output once, outside the profiled collective.
@@ -491,11 +586,11 @@ def _run_reshard(mesh_device, path, workload, system) -> Measurement:
         device=mesh_device,
         layout=path.layout,
         dtype=ttnn.bfloat16,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        memory_config=output_memory_config,
     )
     tt_output, records, program_durations_ns = _profile_programs(
         mesh_device,
-        lambda: _reshard(tt_input, output_buffer, path, system),
+        lambda: _reshard(tt_input, output_buffer, path, system, output_memory_config),
         expected_programs=1,
     )
     assert list(ttnn.get_device_tensors(tt_output)[0].shape) == path.expected_output_shape(workload, mesh_shape)
@@ -520,19 +615,45 @@ def collective_roofline(path: CollectivePath, workload: Workload, mesh_device, s
     participants = mesh_shape[path.collective_axis]
     num_devices = math.prod(mesh_shape)
     if path.partition_dim is None:
-        critical_path_bytes = local_input_bytes * (participants - 1)
-        total_network_bytes = critical_path_bytes * num_devices
-        sustained_directions = 2 if system.topology == ttnn.Topology.Ring else 1
+        if system.topology == ttnn.Topology.Ring:
+            critical_path_bytes = local_input_bytes * (participants - 1) / 2
+            aggregate_cut_bytes = critical_path_bytes * 2
+        else:
+            # Store-and-forward sends every source shard across every cut once. The endpoint cut has (N-1)L
+            # in its busy direction and L in the reverse direction, so its aggregate traffic is NL even though
+            # the (N-1)L directed load determines latency.
+            critical_path_bytes = local_input_bytes * (participants - 1)
+            aggregate_cut_bytes = local_input_bytes * participants
+        sustained_directions = 2
+        total_network_bytes = local_input_bytes * (participants - 1) * num_devices
     else:
         assert system.topology in (ttnn.Topology.Linear, ttnn.Topology.Ring)
-        # Both logical schedules use destination-based routing over the same physical FABRIC_2D mesh.
-        # On the busiest midpoint link, left_sources * right_destinations chunks cross in each direction.
-        midpoint = participants / 2
-        critical_path_bytes = local_input_bytes * midpoint * (participants - midpoint) / participants
-        total_network_bytes = local_input_bytes * num_devices * (participants**2 - 1) / (3 * participants)
-        sustained_directions = 1
+        if system.topology == ttnn.Topology.Linear:
+            # On the busiest midpoint link, left_sources * right_destinations chunks cross in each direction.
+            midpoint = participants / 2
+            critical_path_bytes = local_input_bytes * midpoint * (participants - midpoint) / participants
+            aggregate_cut_bytes = critical_path_bytes * 2
+            total_network_bytes = local_input_bytes * num_devices * (participants**2 - 1) / (3 * participants)
+        else:
+            # Each source sends one L/N chunk to every destination along a shortest path. For an even N, the
+            # antipodal destination is split evenly by DRAM bank across both arcs. This balances every physical cut:
+            # each direction carries half of the aggregate per-cut traffic.
+            assert participants % 2 == 0, "Ring A2A roofline currently requires an even participant count"
+            half_ring = participants // 2
+            chunk_bytes = local_input_bytes / participants
+            average_cut_bytes = chunk_bytes * half_ring * half_ring
+            critical_path_bytes = average_cut_bytes / 2
+            aggregate_cut_bytes = average_cut_bytes
+            total_network_bytes = average_cut_bytes * num_devices
+        sustained_directions = 2
+    if not (path.partition_dim is not None and system.topology == ttnn.Topology.Ring):
+        cuts_per_group = participants if system.topology == ttnn.Topology.Ring else participants - 1
+        groups = num_devices / participants
+        average_cut_bytes = total_network_bytes / (cuts_per_group * groups)
     return CCLTraffic(
         critical_path_bytes=critical_path_bytes,
+        aggregate_cut_bytes=aggregate_cut_bytes,
+        average_cut_bytes=average_cut_bytes,
         total_network_bytes=total_network_bytes,
         link_gigabits_per_second_per_direction=system.link_gigabits_per_second_per_direction,
         num_links=system.num_links,
@@ -544,7 +665,9 @@ def collective_roofline(path: CollectivePath, workload: Workload, mesh_device, s
 def report(path: CollectivePath, scenario: str, mesh_device, measurement: Measurement, traffic: CCLTraffic):
     measured_ns = measurement.duration_ns
     assert measured_ns > 0, "real-time profiler measured no device-program duration"
-    measured_gigabytes_per_second = traffic.critical_path_bytes / measured_ns
+    measured_directed_gigabytes_per_second = traffic.critical_path_bytes / measured_ns
+    measured_aggregate_gigabytes_per_second = traffic.aggregate_cut_bytes / measured_ns
+    measured_network_average_gigabytes_per_second = traffic.average_cut_bytes / measured_ns
     roofline_utilization = traffic.theoretical_ns / measured_ns
     sp, tp = mesh_device.shape
 
@@ -552,19 +675,24 @@ def report(path: CollectivePath, scenario: str, mesh_device, measurement: Measur
         f"{path.name}/{scenario} [SP{sp}xTP{tp}]: {measurement.input_description} -> {measurement.output_description}"
     )
     logger.info(
-        f"theoretical fabric roofline: {traffic.link_gigabits_per_second_per_direction:.1f} "
-        f"Gbps/link/direction x {traffic.num_links} links x {traffic.sustained_directions} direction(s) "
-        f"({traffic.topology}) = "
-        f"{traffic.roofline_gigabits_per_second:.1f} Gbps ({traffic.roofline_gigabytes_per_second:.1f} GB/s); "
-        f"critical-path={traffic.critical_path_bytes / 1e6:.3f} MB, "
+        f"theoretical fabric roofline: {traffic.directed_roofline_gigabytes_per_second:.1f} GB/s/direction "
+        f"x {traffic.sustained_directions} direction(s) ({traffic.topology}) = "
+        f"{traffic.aggregate_roofline_gigabytes_per_second:.1f} GB/s aggregate ingress; "
+        f"critical-direction={traffic.critical_path_bytes / 1e6:.3f} MB, "
+        f"busiest-cut={traffic.aggregate_cut_bytes / 1e6:.3f} MB, "
+        f"average-cut={traffic.average_cut_bytes / 1e6:.3f} MB, "
         f"total-mesh={traffic.total_network_bytes / 1e6:.3f} MB, "
+        f"network-average effective roof={traffic.network_average_roofline_gigabytes_per_second:.1f} GB/s, "
         f"theoretical={traffic.theoretical_ns / 1e3:.3f} us"
     )
     measured_ops = "all_to_all" if path.partition_dim is not None else "all_gather"
     logger.info(
         f"real-time profiler measured: {measured_ns / 1e3:.3f} us ({measured_ops}), "
-        f"achieved ethernet bandwidth={measured_gigabytes_per_second:.3f} / "
-        f"{traffic.roofline_gigabytes_per_second:.3f} GB/s, "
+        f"achieved ethernet bandwidth={measured_aggregate_gigabytes_per_second:.3f} / "
+        f"{traffic.aggregate_roofline_gigabytes_per_second:.3f} GB/s aggregate, "
+        f"critical direction={measured_directed_gigabytes_per_second:.3f} / "
+        f"{traffic.directed_roofline_gigabytes_per_second:.3f} GB/s, "
+        f"network-average effective bandwidth={measured_network_average_gigabytes_per_second:.3f} GB/s, "
         f"roofline utilization={roofline_utilization:.1%}, "
         f"measured/theoretical={measured_ns / traffic.theoretical_ns:.2f}x"
     )
@@ -609,48 +737,136 @@ def _workload(scenario):
     )
 
 
-def _run(mesh_device, path, scenario, topology=ttnn.Topology.Linear):
+def _run(
+    mesh_device,
+    path,
+    scenario,
+    topology=ttnn.Topology.Linear,
+    input_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    output_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+):
     assert mesh_device.arch() == ttnn.Arch.BLACKHOLE, "bandwidth assumptions apply to Blackhole only"
     workload = _workload(scenario)
+    participants = mesh_device.shape[path.collective_axis]
+    if path.partition_dim is not None and participants != GALAXY_TP:
+        # A native LoudBox ring has eight participants while production TP has four. Scale the global head count
+        # so every proxy chip moves the same number of BF16 elements as one production Galaxy chip.
+        workload = Workload(
+            chunk_tokens=workload.chunk_tokens,
+            cache_tokens=workload.cache_tokens,
+            num_attention_heads=workload.num_attention_heads * participants // GALAXY_TP,
+            kv_lora_rank=workload.kv_lora_rank,
+            qk_rope_head_dim=workload.qk_rope_head_dim,
+        )
     system = resolve_runtime_system(mesh_device, path, topology)
-    measurement = run_collective(mesh_device, path, workload, system)
+    measurement = run_collective(
+        mesh_device,
+        path,
+        workload,
+        system,
+        input_memory_config=input_memory_config,
+        output_memory_config=output_memory_config,
+    )
     traffic = collective_roofline(path, workload, mesh_device, system)
     report(path, scenario, mesh_device, measurement, traffic)
 
 
 @pytest.mark.parametrize("scenario", _NON_LOOP_SCENARIOS, ids=_scenario_id)
 @pytest.mark.parametrize(
-    "mesh_device,device_params",
+    "mesh_device,device_params,topology",
     [ccl_mesh_param(SP_AXIS)],
     indirect=["mesh_device", "device_params"],
 )
-def test_kvpe_all_gather_perf(mesh_device, scenario):
+def test_kvpe_all_gather_perf(mesh_device, scenario, topology):
     """Profile the SP all-gather used for the GLM KVPE prefix."""
-    _run(mesh_device, KVPE_ALL_GATHER, scenario)
+    _run(mesh_device, KVPE_ALL_GATHER, scenario, topology)
 
 
-RESHARD_TOPOLOGIES = (ttnn.Topology.Linear, ttnn.Topology.Ring)
+RESHARD_FABRICS = (
+    ccl_mesh_param(TP_AXIS),
+    ccl_mesh_param(
+        TP_AXIS,
+        fabric_config=ttnn.FabricConfig.FABRIC_1D_RING,
+        expected_topology=ttnn.Topology.Ring,
+        require_loudbox_ring=True,
+    ),
+    ccl_mesh_param(
+        TP_AXIS,
+        fabric_config=ttnn.FabricConfig.FABRIC_2D_TORUS_X,
+        expected_topology=ttnn.Topology.Ring,
+        require_galaxy=True,
+    ),
+)
 
 
-@pytest.mark.parametrize("scenario", _NON_LOOP_SCENARIOS, ids=_scenario_id)
-@pytest.mark.parametrize("topology", RESHARD_TOPOLOGIES, ids=["linear", "ring"])
 @pytest.mark.parametrize(
-    "mesh_device,device_params",
-    [ccl_mesh_param(TP_AXIS)],
+    "mesh_device,device_params,topology",
+    RESHARD_FABRICS,
     indirect=["mesh_device", "device_params"],
 )
-def test_glm_head_to_sequence_reshard_perf(mesh_device, scenario, topology):
+def test_glm_head_to_sequence_reshard_perf(mesh_device, topology):
     """Profile GLM's head-sharded to sequence-sharded TP redistribution."""
-    _run(mesh_device, GLM_HEAD_TO_SEQUENCE, scenario, topology)
+    _run(mesh_device, GLM_HEAD_TO_SEQUENCE, "warm", topology)
 
 
-@pytest.mark.parametrize("scenario", _NON_LOOP_SCENARIOS, ids=_scenario_id)
-@pytest.mark.parametrize("topology", RESHARD_TOPOLOGIES, ids=["linear", "ring"])
 @pytest.mark.parametrize(
-    "mesh_device,device_params",
+    "mesh_device,device_params,topology",
+    RESHARD_FABRICS,
+    indirect=["mesh_device", "device_params"],
+)
+def test_glm_sequence_to_head_reshard_perf(mesh_device, topology):
+    """Profile GLM's sequence-sharded to head-sharded TP redistribution."""
+    _run(mesh_device, GLM_SEQUENCE_TO_HEAD, "warm", topology)
+
+
+_L1_INTERLEAVED = ttnn.MemoryConfig(buffer_type=ttnn.BufferType.L1)
+
+
+@pytest.mark.skipif(detect_num_devices() != 8, reason="A2A stage-isolation proxies are LoudBox-only")
+@pytest.mark.parametrize(
+    "mesh_device,device_params,topology",
     [ccl_mesh_param(TP_AXIS)],
     indirect=["mesh_device", "device_params"],
 )
-def test_glm_sequence_to_head_reshard_perf(mesh_device, scenario, topology):
-    """Profile GLM's sequence-sharded to head-sharded TP redistribution."""
-    _run(mesh_device, GLM_SEQUENCE_TO_HEAD, scenario, topology)
+def test_glm_head_to_sequence_reshard_l1_reader_perf(mesh_device, topology):
+    """Remove source DRAM reads while retaining the bank-owned mux/fabric/output schedule."""
+    _run(
+        mesh_device,
+        GLM_HEAD_TO_SEQUENCE,
+        "warm",
+        topology,
+        input_memory_config=_L1_INTERLEAVED,
+    )
+
+
+@pytest.mark.skipif(detect_num_devices() != 8, reason="A2A stage-isolation proxies are LoudBox-only")
+@pytest.mark.parametrize(
+    "mesh_device,device_params,topology",
+    [ccl_mesh_param(TP_AXIS)],
+    indirect=["mesh_device", "device_params"],
+)
+def test_glm_sequence_to_head_reshard_l1_reader_perf(mesh_device, topology):
+    """Remove source DRAM reads while retaining the bank-owned mux/fabric/output schedule."""
+    _run(
+        mesh_device,
+        GLM_SEQUENCE_TO_HEAD,
+        "warm",
+        topology,
+        input_memory_config=_L1_INTERLEAVED,
+    )
+
+
+_RESHARD_PACKET_PAYLOADS = tuple(
+    ccl_mesh_param(TP_AXIS, max_payload_size=max_payload_size)
+    for max_payload_size in (3072, 5120, 7168, 9216, 11264, 13312, 14336)
+)
+
+
+@pytest.mark.parametrize(
+    "mesh_device,device_params,topology",
+    _RESHARD_PACKET_PAYLOADS,
+    indirect=["mesh_device", "device_params"],
+)
+def test_glm_head_to_sequence_reshard_packet_payload_perf(mesh_device, topology):
+    """Measure the transaction-rate curve with one through seven 2 KiB pages per fabric packet."""
+    _run(mesh_device, GLM_HEAD_TO_SEQUENCE, "warm", topology)

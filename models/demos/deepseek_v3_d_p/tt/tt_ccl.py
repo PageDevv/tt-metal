@@ -139,6 +139,10 @@ class TT_CCL:
         # capacity is the fixed prefill chunk length, not the growing KV-cache length.
         self.mla_high_bw_all_gather_buffers: dict[tuple, "ttnn.Tensor"] = {}
 
+        # Persistent outputs for sparse MLA's GLM head<->sequence all-to-all reshards. These are
+        # per-device output shapes and are shared by serial MLA layers at stable addresses.
+        self.mla_all_to_all_buffers: dict[tuple, "ttnn.Tensor"] = {}
+
         # Persistent ring-indexer gathered-K scratch buffers shared by every layer's DSA indexer,
         # keyed by shape signature. See get_indexer_ring_k_buffer.
         self.indexer_ring_k_buffers: dict[tuple, "ttnn.Tensor"] = {}
@@ -267,6 +271,24 @@ class TT_CCL:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
         return self.mla_high_bw_all_gather_buffers[key]
+
+    def get_mla_all_to_all_buffer(self, *, name, shape, dtype=ttnn.bfloat16):
+        """Return an init-time output buffer for a sparse MLA all-to-all reshard.
+
+        ``shape`` is the local output shape on each device. The all-to-all operation writes the
+        correct local slice on every chip, so a replicated mesh allocation is the appropriate
+        stable backing store. All MLA layers run serially and have identical activation geometry.
+        """
+        key = (name, tuple(shape), dtype)
+        if key not in self.mla_all_to_all_buffers:
+            self.mla_all_to_all_buffers[key] = ttnn.empty(
+                shape,
+                device=self.mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=dtype,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        return self.mla_all_to_all_buffers[key]
 
     def get_indexer_ring_k_buffer(self, *, local_k, sp_axis):
         """Return the persistent full-K output buffer for the fused ring indexer.
