@@ -75,6 +75,12 @@ mkdir -p "$LOG_DIR"
    missing, return `TESTS_FAILED` with
    `MISSING_TEST_COVERAGE: <specific evidence>`. `METAL_TARGET=none` is valid
    only when verification is not required and must not reach this agent.
+   Also require the checksummed `REQUIRED_VERIFICATION_MANIFEST` from run state
+   to contain exactly one `suite=metal` leaf for each in-scope architecture,
+   with `selector.test` exactly equal to `METAL_FILTER`. Export its `run_id`,
+   `attempt_id`, and leaf `requirement_id` as `CODEGEN_RUN_ID`,
+   `CODEGEN_ATTEMPT_ID`, and `CODEGEN_REQUIREMENT_ID` for local or queued
+   execution. A missing or ambiguous leaf is an environment error; do not run.
 2. Normalize the ordered architecture list from `TARGET_ARCHES_JSON` or
    `TARGET_ARCH`.
 3. Build locally. A failed build returns `COMPILE_FAILED` without submitting
@@ -205,26 +211,40 @@ These are queue transport limitations, not replacements for the mandatory
 local build gate above.
 
 ```bash
-QUEUE_ARCHES=()
 for arch in "${ARCHES[@]}"; do
-  [ "$arch" = quasar ] || QUEUE_ARCHES+=("$arch")
-done
-ARCHES_CSV="$(IFS=,; echo "${QUEUE_ARCHES[*]}")"
-set +e
-if [ -n "$ARCHES_CSV" ]; then
-  $HW_TEST_DISPATCH_CMD --kind metal --arch "$ARCHES_CSV" \
+  [ "$arch" = quasar ] && continue
+  # Resolve this architecture's one sealed metal leaf before dispatch and set
+  # CODEGEN_RUN_ID/CODEGEN_ATTEMPT_ID/CODEGEN_REQUIREMENT_ID from it.
+  mkdir -p "$LOG_DIR/verification-results/${CODEGEN_ATTEMPT_ID}"
+  RESULT_JSON_OUT="$LOG_DIR/verification-results/${CODEGEN_ATTEMPT_ID}/${CODEGEN_REQUIREMENT_ID}.json"
+  result_args=()
+  if [ "${CODEGEN_RUNNER_POOL:-prod}" = audit ]; then
+    result_args+=(--result-json-out "$RESULT_JSON_OUT")
+  fi
+  set +e
+  $HW_TEST_DISPATCH_CMD --kind metal --arch "$arch" \
     --test "$METAL_FILTER" --dispatch "${METAL_DISPATCH:-fast}" \
     --worktree "$WORKTREE_DIR" \
     --base "$(sg GIT_COMMIT)" \
-    --session "${HW_TEST_SESSION:-issue-${ISSUE_NUMBER}}" \
+    --session "${HW_TEST_SESSION:-issue-${ISSUE_NUMBER}}-${arch}" \
+    "${result_args[@]}" \
     --timeout "${TIMEOUT:-1800}" 2>&1 | tee -a "$LOG_DIR/metal_run.log"
   dispatch_exit=${PIPESTATUS[0]}
-fi
-set -e
+  set -e
+  # Record this architecture's marker/result before dispatching the next leaf.
+done
 ```
 
-Require exactly one final `HW_TEST_RESULT arch=<arch>` marker for each
-queued Blackhole/Wormhole architecture and record its `job` value:
+Require exactly one final `HW_TEST_RESULT arch=<arch>` marker for each queued
+Blackhole/Wormhole invocation and record its `job` value. For an audit run,
+also require the exact protocol-v2 result at `RESULT_JSON_OUT`, validate its
+sealed identity, and derive the suite verdict and counts from its
+`classification`, `collection`, and `execution` records exactly as in
+`tester.md`. The strict reducer is authoritative; the marker and dispatch exit
+are supporting evidence only.
+
+For production compatibility, do not request a protocol-v2 result copy and use
+the legacy marker:
 
 | Marker | Verdict |
 |---|---|
@@ -232,10 +252,10 @@ queued Blackhole/Wormhole architecture and record its `job` value:
 | `ok=false ran=true` | `TESTS_FAILED` |
 | missing, malformed, or `ran=false` | `ENV_ERROR` |
 
-Use the marker summary for counts when present. If counts are absent, use
-zero and state that the queue did not report them; never infer a passing count.
-The overall dispatch exit is supporting evidence only because one failed
-architecture makes a multi-arch call non-zero.
+If legacy counts are absent, use zero and state that the queue did not report
+them; never infer a passing count. The overall dispatch exit is supporting
+evidence only because one failed architecture makes a multi-arch call
+non-zero.
 
 Do not set `TT_METAL_SIMULATOR`, `TT_METAL_CACHE`,
 `TT_METAL_SLOW_DISPATCH_MODE`, or card locks on this route. Return after
