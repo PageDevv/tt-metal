@@ -19,7 +19,11 @@ from helpers.llk_params import (
     ReducePool,
     format_dict,
 )
-from helpers.param_config import input_output_formats, parametrize
+from helpers.param_config import (
+    input_output_formats,
+    is_32_bit_unpack_to_dest,
+    parametrize,
+)
 from helpers.stimuli_config import StimuliConfig
 from helpers.stimuli_generator import generate_stimuli
 from helpers.test_config import TestConfig
@@ -117,9 +121,7 @@ def test_semaphore_sync_quasar(
             tile_count_B=1,
             tile_count_res=tile_cnt,
         ),
-        unpack_to_dest=(
-            formats.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-        ),
+        unpack_to_dest=is_32_bit_unpack_to_dest(formats, dest_acc),
         dest_acc=dest_acc,
         # MX formats require disable_format_inference to match C++ IMPLIED_MATH_FORMAT setting.
         disable_format_inference=(

@@ -22,6 +22,7 @@ from helpers.llk_params import (
 )
 from helpers.param_config import (
     input_output_formats,
+    is_32_bit_unpack_to_dest,
     is_invalid_quasar_sfpu_format_combination,
     parametrize,
     runtime,
@@ -685,7 +686,7 @@ def quasar_unpack_to_dest(formats, dest_acc, is_typecast):
     """
     if is_typecast:
         return formats.input_format.is_32_bit() or formats.output_format.is_32_bit()
-    return formats.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
+    return is_32_bit_unpack_to_dest(formats, dest_acc)
 
 
 def _typecast_pack_src_format(

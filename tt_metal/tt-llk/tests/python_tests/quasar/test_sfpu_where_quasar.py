@@ -17,6 +17,7 @@ from helpers.llk_params import (
 from helpers.param_config import (
     generate_sfpu_format_dest_acc_combinations,
     input_output_formats,
+    is_32_bit_unpack_to_dest,
     parametrize,
     runtime,
 )
@@ -58,11 +59,6 @@ def _processed_face_mask(vector_mode: VectorMode, num_faces: int) -> torch.Tenso
     return mask
 
 
-def _is_unpack_to_dest(fmt: FormatConfig, dest_acc: DestAccumulation) -> bool:
-    """UNPACK→DEST is selected only for 32-bit inputs with dest_acc=Yes."""
-    return fmt.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-
-
 def _get_valid_formats_dest_acc():
     formats = input_output_formats(
         [
@@ -74,7 +70,7 @@ def _get_valid_formats_dest_acc():
     return [
         (fmt, dest_acc)
         for fmt, dest_acc in generate_sfpu_format_dest_acc_combinations(
-            formats, unpack_to_dest=_is_unpack_to_dest
+            formats, unpack_to_dest=is_32_bit_unpack_to_dest
         )
         if not (
             fmt.input_format == DataFormat.Float16 and dest_acc == DestAccumulation.Yes
@@ -168,7 +164,7 @@ def test_sfpu_where_quasar(
     torch_format_out = format_dict[formats.output_format]
     golden_tensor = golden_tensor.to(torch_format_out)
 
-    unpack_to_dest = _is_unpack_to_dest(formats, dest_acc)
+    unpack_to_dest = is_32_bit_unpack_to_dest(formats, dest_acc)
     src_B_dummy = torch.zeros_like(condition)
 
     configuration = TestConfig(
@@ -259,7 +255,7 @@ def test_sfpu_where_mcw_quasar(
     torch_format_out = format_dict[formats.output_format]
     golden_tensor = golden_tensor.to(torch_format_out)
 
-    unpack_to_dest = _is_unpack_to_dest(formats, dest_acc)
+    unpack_to_dest = is_32_bit_unpack_to_dest(formats, dest_acc)
     src_B_dummy = torch.zeros_like(condition)
 
     configuration = TestConfig(

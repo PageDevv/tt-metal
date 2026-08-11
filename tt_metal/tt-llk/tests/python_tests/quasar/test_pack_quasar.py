@@ -24,6 +24,7 @@ from helpers.llk_params import (
 from helpers.param_config import (
     generate_unary_input_dimensions,
     input_output_formats,
+    is_32_bit_unpack_to_dest,
     parametrize,
     runtime,
 )
@@ -242,9 +243,7 @@ def test_pack_quasar(
     num_faces = tile_shape.total_num_faces()
 
     # Same method as test_pack.py for original ReLu testing and threshold tolerance issue
-    unpack_to_dest = (
-        formats.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-    )
+    unpack_to_dest = is_32_bit_unpack_to_dest(formats, dest_acc)
     data_formats = infer_data_formats(
         input_format=formats.input_format,
         output_format=formats.output_format,

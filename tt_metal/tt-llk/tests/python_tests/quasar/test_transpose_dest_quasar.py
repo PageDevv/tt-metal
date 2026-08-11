@@ -26,6 +26,7 @@ from helpers.param_config import (
     BlocksCalculationAlgorithm,
     get_num_blocks_and_num_tiles_in_block,
     input_output_formats,
+    is_32_bit_unpack_to_dest,
     parametrize,
     runtime,
 )
@@ -314,9 +315,7 @@ def test_transpose_dest_quasar(
             golden_tensor.to(torch.bfloat16), formats.output_format
         )
 
-    unpack_to_dest = (
-        formats.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-    )
+    unpack_to_dest = is_32_bit_unpack_to_dest(formats, dest_acc)
 
     if is_perf and perf_report is None:
         raise ValueError("perf_report must be provided when is_perf=True")

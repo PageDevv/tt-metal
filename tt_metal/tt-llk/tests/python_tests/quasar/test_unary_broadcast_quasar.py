@@ -21,6 +21,7 @@ from helpers.param_config import (
     BlocksCalculationAlgorithm,
     get_num_blocks_and_num_tiles_in_block,
     input_output_formats,
+    is_32_bit_unpack_to_dest,
     parametrize,
     runtime,
 )
@@ -135,9 +136,7 @@ def test_unary_broadcast_quasar(
     is_perf=False,
     perf_report=None,
 ):
-    unpack_to_dest = (
-        formats.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-    )
+    unpack_to_dest = is_32_bit_unpack_to_dest(formats, dest_acc)
 
     tile_rows, tile_cols = TILE_DIMENSIONS
     face_r_dim, num_faces_r_dim, num_faces_c_dim = get_tile_params(

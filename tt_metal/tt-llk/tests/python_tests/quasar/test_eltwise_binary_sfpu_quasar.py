@@ -26,7 +26,9 @@ from helpers.param_config import (
     InputOutputFormat,
     generate_sfpu_format_dest_acc_combinations,
     input_output_formats,
+    is_32_bit_unpack_to_dest,
     is_invalid_quasar_sfpu_format_combination,
+    is_matching_width_unpack_to_dest,
     parametrize,
     runtime,
 )
@@ -133,9 +135,7 @@ def _run_sfpu_binary_llk_golden(
     input_dimensions = [(max(src0_idx, src1_idx, dst_idx) + 1) * 32, 32]
     num_faces = MAX_NUM_FACES
 
-    unpack_to_dest = formats.input_format.is_32_bit() == (
-        dest_acc == DestAccumulation.Yes
-    )
+    unpack_to_dest = is_matching_width_unpack_to_dest(formats, dest_acc)
 
     src_A, tile_cnt_A, src_B = prepare_stimuli(
         formats, input_dimensions, src0_idx, src1_idx, mathop
@@ -323,7 +323,7 @@ def _get_valid_float_formats_dest_acc():
     return [
         (fmt, dest_acc)
         for fmt, dest_acc in generate_sfpu_format_dest_acc_combinations(
-            formats, unpack_to_dest=True
+            formats, unpack_to_dest=is_matching_width_unpack_to_dest
         )
         if not (
             fmt.input_format == DataFormat.Float16 and dest_acc == DestAccumulation.Yes
@@ -527,12 +527,6 @@ def prepare_binary_max_min_inputs(src_A, src_B, input_format, output_format):
     return in0, in1
 
 
-def _max_min_unpack_to_dest(fmt: FormatConfig, dest_acc: DestAccumulation) -> bool:
-    """UNPACK→DEST is selected only for a 32-bit input with a 32-bit Dest; every other
-    max/min variant goes UNPACK -> SrcA -> FPU datacopy -> Dest."""
-    return fmt.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-
-
 def _generate_max_min_combinations(
     formats_list: List[FormatConfig],
     dest_acc_for_format,
@@ -544,7 +538,7 @@ def _generate_max_min_combinations(
     for fmt in formats_list:
         for dest_acc in dest_acc_for_format(fmt):
             if is_invalid_quasar_sfpu_format_combination(
-                fmt, dest_acc, _max_min_unpack_to_dest(fmt, dest_acc)
+                fmt, dest_acc, is_32_bit_unpack_to_dest(fmt, dest_acc)
             ):
                 continue
             for implied_math_format in implied_math_formats:
@@ -642,7 +636,7 @@ def _run_max_min(
         buffer_B_dummy = in1
         disable_format_inference = formats.input_format.is_mx_format()
 
-    unpack_to_dest = _max_min_unpack_to_dest(formats, dest_acc)
+    unpack_to_dest = is_32_bit_unpack_to_dest(formats, dest_acc)
 
     if is_perf and perf_report is None:
         raise ValueError("perf_report must be provided when is_perf=True")

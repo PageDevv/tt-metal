@@ -492,7 +492,8 @@ def is_invalid_quasar_sfpu_format_combination(
     ):
         return True
 
-    # Quasar SFPU no use of input of 16bit to have 32bit dest (dest_acc=Yes) when output is 16bit
+    # Quasar SFPU does not support unpacking a sub-32-bit input into a 32-bit Dest (dest_acc=Yes)
+    # when the output is also sub-32-bit.
     if (
         not in_fmt.is_32_bit()
         and not out_fmt.is_32_bit()
@@ -516,6 +517,18 @@ def is_invalid_quasar_sfpu_format_combination(
 
 
 UnpackToDest = Union[bool, Callable[[FormatConfig, DestAccumulation], bool]]
+
+
+def is_32_bit_unpack_to_dest(fmt: FormatConfig, dest_acc: DestAccumulation) -> bool:
+    """Select UNPACK→DEST only for a 32-bit input with a 32-bit Dest."""
+    return fmt.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
+
+
+def is_matching_width_unpack_to_dest(
+    fmt: FormatConfig, dest_acc: DestAccumulation
+) -> bool:
+    """Select UNPACK→DEST when the input width matches the Dest register width."""
+    return fmt.input_format.is_32_bit() == (dest_acc == DestAccumulation.Yes)
 
 
 def resolve_unpack_to_dest(

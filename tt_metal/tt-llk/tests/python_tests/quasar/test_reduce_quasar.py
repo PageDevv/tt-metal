@@ -24,7 +24,11 @@ from helpers.llk_params import (
     ReducePool,
     format_dict,
 )
-from helpers.param_config import input_output_formats, parametrize
+from helpers.param_config import (
+    input_output_formats,
+    is_32_bit_unpack_to_dest,
+    parametrize,
+)
 from helpers.perf.core import PerfConfig
 from helpers.stimuli_config import StimuliConfig
 from helpers.stimuli_generator import generate_stimuli
@@ -278,9 +282,7 @@ def test_reduce_quasar(
             tile_dimensions=tile_dimensions,
             use_dense_tile_dimensions=True,
         ),
-        "unpack_to_dest": (
-            formats.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-        ),
+        "unpack_to_dest": is_32_bit_unpack_to_dest(formats, dest_acc),
         "dest_acc": dest_acc,
         "disable_format_inference": (
             implied_math_format == ImpliedMathFormat.Yes

@@ -20,6 +20,7 @@ from helpers.llk_params import (
 from helpers.param_config import (
     generate_unary_input_dimensions,
     input_output_formats,
+    is_32_bit_unpack_to_dest,
     parametrize,
     runtime,
 )
@@ -242,9 +243,7 @@ def test_eltwise_binary(
             tile_count_res=tile_cnt_res,
             num_faces=num_faces,
         ),
-        "unpack_to_dest": (
-            formats.input_format.is_32_bit() and dest_acc == DestAccumulation.Yes
-        ),
+        "unpack_to_dest": is_32_bit_unpack_to_dest(formats, dest_acc),
         "dest_acc": dest_acc,
         "disable_format_inference": formats.input_format.is_mx_format(),
     }
