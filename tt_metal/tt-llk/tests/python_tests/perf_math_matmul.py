@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-from itertools import chain, product
+from itertools import product
 
 import pytest
 from helpers.format_config import DataFormat, is_dest_acc_needed
@@ -11,8 +11,9 @@ from helpers.llk_params import (
     MathFidelity,
     PerfRunType,
     StochasticRounding,
+    Transpose,
 )
-from helpers.matmul_sweep import sweep_matmul, sweep_tiny_tiles_matmul
+from helpers.matmul_sweep import FaceLayoutConfig, MatmulConfig, TileDimensions
 from helpers.param_config import input_output_formats
 from helpers.perf.core import PerfConfig
 from helpers.stimuli_config import StimuliConfig
@@ -33,56 +34,92 @@ from helpers.test_variant_parameters import (
 
 MATMUL_FORMATS = input_output_formats(
     [
-        DataFormat.Bfp8_b,
-        DataFormat.Float16_b,
         DataFormat.Float16,
         DataFormat.Float32,
     ]
 )
 DEST_ACC_MODES = [DestAccumulation.No, DestAccumulation.Yes]
 DEST_SYNC_MODES = [DestSync.Half, DestSync.Full]
-STOCHASTIC_ROUNDING_MODES = [StochasticRounding.No]
 MATH_FIDELITIES = [
     MathFidelity.LoFi,
     MathFidelity.HiFi2,
     MathFidelity.HiFi3,
     MathFidelity.HiFi4,
 ]
+OUTPUT_TILE_GRIDS = [(2, 4), (4, 4), (4, 8), (8, 8), (8, 16)]
+IN0_TILE_DIMENSIONS = [(16, 32), (32, 32)]
 
-MATMUL_COMBINATIONS = sweep_matmul(
-    MATMUL_FORMATS,
-    DEST_ACC_MODES,
-    STOCHASTIC_ROUNDING_MODES,
-    DEST_SYNC_MODES,
-    math_matmul=True,
-)
 
-TINY_TILES_MATMUL_COMBINATIONS = sweep_tiny_tiles_matmul(
-    MATMUL_FORMATS,
-    DEST_ACC_MODES,
-    STOCHASTIC_ROUNDING_MODES,
-    DEST_SYNC_MODES,
-    math_matmul=True,
-)
+def generate_experiment_combinations():
+    """Generate a focused tile-count scaling experiment.
 
-ALL_TEST_PARAMS = list(
-    chain(
-        # Regular matmul combinations with all throttle levels
-        # ( Commented to reduce number of tests since CI fails with no free space left on device
-        #     (fidelity, combinations, throttle)
-        #     for fidelity, combinations, throttle in product(
-        #         MATH_FIDELITIES, MATMUL_COMBINATIONS, [1, 2, 3, 4, 5]
-        #     )
-        # ),
-        # Tiny tiles matmul combinations with throttle level 1 only
-        (
-            (fidelity, combinations, 0)
-            for fidelity, combinations in product(
-                MATH_FIDELITIES, TINY_TILES_MATMUL_COMBINATIONS
+    KT remains one while balanced RT x CT grids scale the output from 8 to 128
+    tiles. The kernel splits grids larger than destination capacity into
+    destination-sized blocks.
+    """
+    combinations = []
+    for (
+        formats,
+        dest_acc,
+        dest_sync,
+        (in0_tile_rows, in0_tile_cols),
+        (rt_dim, ct_dim),
+    ) in product(
+        MATMUL_FORMATS,
+        DEST_ACC_MODES,
+        DEST_SYNC_MODES,
+        IN0_TILE_DIMENSIONS,
+        OUTPUT_TILE_GRIDS,
+    ):
+        tile_count = rt_dim * ct_dim
+        is_tiny_tile = in0_tile_rows < 32
+        num_faces_in0 = 2 if is_tiny_tile else 4
+        output_num_faces = 2 if is_tiny_tile else 4
+
+        combinations.append(
+            MatmulConfig(
+                tile_dimensions=TileDimensions(
+                    in0_dimensions=(rt_dim * in0_tile_rows, 32),
+                    in1_dimensions=(32, ct_dim * 32),
+                    output_dimensions=(rt_dim * in0_tile_rows, ct_dim * 32),
+                    rt_dim=rt_dim,
+                    ct_dim=ct_dim,
+                    kt_dim=1,
+                    tile_cnt=tile_count,
+                    tile_cnt_in0=rt_dim,
+                    tile_cnt_in1=ct_dim,
+                    output_tile_cnt=tile_count,
+                    in0_tile_r_dim=in0_tile_rows,
+                    in0_tile_c_dim=in0_tile_cols,
+                    in1_tile_r_dim=32,
+                    in1_tile_c_dim=32,
+                ),
+                face_layout_config=FaceLayoutConfig(
+                    unpack_transpose_faces=Transpose.No,
+                    unpack_transpose_within_face=Transpose.No,
+                    num_faces_in0=num_faces_in0,
+                    num_faces_in1=4,
+                    num_faces=output_num_faces,
+                    partial_face_in0=is_tiny_tile,
+                    partial_face_in1=False,
+                    partial_face_math=False,
+                    partial_face_pack=is_tiny_tile,
+                ),
+                formats=formats,
+                stochastic_rnd=StochasticRounding.No,
+                dst_index=0,
+                dest_sync=dest_sync,
+                dest_acc=dest_acc,
             )
-        ),
-    )
-)
+        )
+    return combinations
+
+
+MATMUL_COMBINATIONS = generate_experiment_combinations()
+ALL_TEST_PARAMS = [
+    (fidelity, combination, 0)
+    for fidelity, combination in product(MATH_FIDELITIES, MATMUL_COMBINATIONS)
+]
 
 
 @pytest.mark.perf
@@ -94,10 +131,10 @@ def test_perf_math_matmul(
     perf_report,
 ):
     """
-    Performance test for matmul operations.
+    Matmul performance scaling experiment for 16x32 and 32x32 input-0 tiles.
 
-    Includes both regular matmul (full 32x32 tiles) and tiny tiles matmul
-    (input 0 with rows: 1, 2, 4, 8, 16 and columns: 32, input 1 always 32x32).
+    KT remains one while balanced RT x CT output grids contain
+    8, 16, 32, 64, or 128 tiles.
     """
     formats = matmul_config.formats
     in0_dimensions = matmul_config.tile_dimensions.in0_dimensions
