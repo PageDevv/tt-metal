@@ -28,7 +28,8 @@ void run_kernel(RUNTIME_PARAMETERS params)
 #endif
 #ifndef SPEED_OF_LIGHT
     const std::uint32_t LOOP_FACTOR     = params.LOOP_FACTOR;
-    const std::uint32_t TILE_CNT        = params.TILE_CNT;
+    const std::uint32_t tiles_in_block  = params.OUTPUT_NUM_TILES_IN_BLOCK;
+    const std::uint32_t num_blocks      = static_cast<std::uint32_t>(params.INPUT_NUM_BLOCKS);
     const std::uint32_t num_faces       = params.num_faces;
     const std::uint32_t TEST_FACE_C_DIM = params.TEST_FACE_C_DIM;
     const std::uint32_t TEST_FACE_R_DIM = params.TEST_FACE_R_DIM;
@@ -37,7 +38,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
 #endif
     tdma_descriptor_t td_val;
     const std::uint32_t buf_desc_id          = 0;
-    const std::uint32_t num_tiles_per_unpack = TILE_CNT;
+    const std::uint32_t num_tiles_per_unpack = tiles_in_block;
 
     {
         ZONE_SCOPED("INIT")
@@ -84,6 +85,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
         _configure_buf_desc_table_(td_val.buf_desc_id, td_val.buf_desc);
         if constexpr (is_fp32_dest_acc_en && !unpack_to_dest)
         {
+            // If Dest is in 32bit mode and operation is Mov2D, we need both SrcA/B fmts to be configured since Mov2D will be implemented via ELWADD
             _llk_unpack_configure_binary_<p_unpacr::UNP_A, p_unpacr::UNP_B>(td_val, td_val);
         }
         else
@@ -105,7 +107,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
             // Real unpack produces all SrcA tiles first, then the dummy SrcB
             // tiles consumed by transpose. Preserve that ordering: the two
             // MOPs cannot be mocked as one simultaneous SrcAB handshake.
-            const std::uint32_t tiles_per_loop = TILE_CNT;
+            const std::uint32_t tiles_per_loop = num_blocks * tiles_in_block;
             for (std::uint32_t loop = 0; loop < LOOP_FACTOR; loop++)
             {
                 if constexpr (!unpack_to_dest)
@@ -119,21 +121,24 @@ void run_kernel(RUNTIME_PARAMETERS params)
         {
             for (std::uint32_t loop = 0; loop < LOOP_FACTOR; loop++)
             {
-                _llk_unpack_unary_operand_<UNPACKER_ENGINE_SEL>(0 /*l1_tile_idx*/, ckernel::DEFAULT_TENSOR_SHAPE);
-
-                if constexpr (unpack_to_dest)
+                for (std::uint32_t block = 0; block < num_blocks; block++)
                 {
-                    if constexpr (PERF_RUN_TYPE == PerfRunType::L1_TO_L1)
+                    _llk_unpack_unary_operand_<UNPACKER_ENGINE_SEL>(block * tiles_in_block /*l1_tile_idx*/, ckernel::DEFAULT_TENSOR_SHAPE);
+
+                    if constexpr (unpack_to_dest)
                     {
-                        _llk_unpack_dest_dvalid_section_done_<dest_sync>();
+                        if constexpr (PERF_RUN_TYPE == PerfRunType::L1_TO_L1)
+                        {
+                            _llk_unpack_dest_dvalid_section_done_<dest_sync>();
+                        }
                     }
-                }
 
-                // After datacopy consumes SrcA and clears its dvalid, provide
-                // dummy SrcA+SrcB dvalid so transpose dest can use srcA/B.
-                for (std::uint32_t i = 0; i < TILE_CNT; ++i)
-                {
-                    _llk_unpack_set_srcB_dummy_valid_();
+                    // After datacopy consumes SrcA and clears its dvalid, provide
+                    // dummy SrcA+SrcB dvalid so transpose dest can use srcA/B.
+                    for (std::uint32_t i = 0; i < tiles_in_block; ++i)
+                    {
+                        _llk_unpack_set_srcB_dummy_valid_();
+                    }
                 }
             }
         }
@@ -156,37 +161,42 @@ template <bool set_dvalid>
 inline void run_datacopy_transpose_loop(
     const DataFormat math_format,
     const std::uint32_t loop_factor,
-    const std::uint32_t tile_cnt,
+    const std::uint32_t num_blocks,
+    const std::uint32_t tiles_in_block,
     const std::uint32_t num_faces,
     const std::uint32_t face_r_dim,
     const int dst_index)
 {
     for (std::uint32_t loop = 0; loop < loop_factor; loop++)
     {
-        if constexpr (!unpack_to_dest)
+        for (std::uint32_t block = 0; block < num_blocks; block++)
         {
-            // Datacopy and transpose both use bank0's instruction buffer, so
-            // each operation must program its MOP immediately before execution.
-            _configure_default_alu_data_format_state_<IMPLIED_MATH_FORMAT, is_fp32_dest_acc_en>(math_format, math_format);
-            _llk_math_eltwise_unary_datacopy_init_<DATA_COPY_TYPE, is_fp32_dest_acc_en>(num_faces * face_r_dim /*num_rows_per_matrix*/, 1 /*num_matrices*/);
-            for (std::uint32_t i = 0; i < tile_cnt; ++i)
+            if constexpr (!unpack_to_dest)
             {
-                _llk_math_eltwise_unary_datacopy_(dst_index + i);
+                // Datacopy and transpose both use bank0's instruction buffer, so
+                // each operation must program its MOP immediately before execution.
+                _configure_default_alu_data_format_state_<IMPLIED_MATH_FORMAT, is_fp32_dest_acc_en>(math_format, math_format);
+                _llk_math_eltwise_unary_datacopy_init_<DATA_COPY_TYPE, is_fp32_dest_acc_en>(num_faces * face_r_dim /*num_rows_per_matrix*/, 1 /*num_matrices*/);
+
+                for (std::uint32_t i = 0; i < tiles_in_block; ++i)
+                {
+                    _llk_math_eltwise_unary_datacopy_(dst_index + i);
+                }
             }
-        }
 
-        // Int32/Float32 transpose dest requires non-default SrcA/SrcB format
-        // settings and disables implied math format.
-        _configure_mov_ops_explicit_alu_data_format_state_<is_fp32_dest_acc_en>(math_format, math_format);
-        _llk_math_transpose_dest_init_<MATH_TRANSPOSE_FACES, is_fp32_dest_acc_en>();
-        for (std::uint32_t i = 0; i < tile_cnt; ++i)
-        {
-            _llk_math_transpose_dest_(dst_index + i);
-        }
+            // Int32/Float32 transpose dest requires non-default SrcA/SrcB format
+            // settings and disables implied math format.
+            _configure_mov_ops_explicit_alu_data_format_state_<is_fp32_dest_acc_en>(math_format, math_format);
+            _llk_math_transpose_dest_init_<MATH_TRANSPOSE_FACES, is_fp32_dest_acc_en>();
+            for (std::uint32_t i = 0; i < tiles_in_block; ++i)
+            {
+                _llk_math_transpose_dest_(dst_index + i);
+            }
 
-        if constexpr (set_dvalid)
-        {
-            _llk_math_set_dvalid_<p_cleardvalid::FPU, dest_sync>();
+            if constexpr (set_dvalid)
+            {
+                _llk_math_set_dvalid_<p_cleardvalid::FPU, dest_sync>();
+            }
         }
     }
 }
@@ -198,7 +208,8 @@ void run_kernel(RUNTIME_PARAMETERS params)
 #endif
 #ifndef SPEED_OF_LIGHT
     const std::uint32_t LOOP_FACTOR     = params.LOOP_FACTOR;
-    const std::uint32_t TILE_CNT        = params.TILE_CNT;
+    const std::uint32_t tiles_in_block  = params.OUTPUT_NUM_TILES_IN_BLOCK;
+    const std::uint32_t num_blocks      = params.INPUT_NUM_BLOCKS;
     const std::uint32_t num_faces       = params.num_faces;
     const std::uint32_t TEST_FACE_R_DIM = params.TEST_FACE_R_DIM;
     const int DST_INDEX                 = params.DST_INDEX;
@@ -236,7 +247,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
         else if constexpr (PERF_RUN_TYPE == PerfRunType::UNPACK_ISOLATE || PERF_RUN_TYPE == PerfRunType::L1_CONGESTION)
         {
             // Real unpack emits SrcA and dummy SrcB as two ordered batches.
-            const std::uint32_t tiles_per_loop = TILE_CNT;
+            const std::uint32_t tiles_per_loop = num_blocks * tiles_in_block;
             for (std::uint32_t loop = 0; loop < LOOP_FACTOR; loop++)
             {
                 if constexpr (!unpack_to_dest)
@@ -248,11 +259,11 @@ void run_kernel(RUNTIME_PARAMETERS params)
         }
         else if constexpr (PERF_RUN_TYPE == PerfRunType::MATH_ISOLATE)
         {
-            run_datacopy_transpose_loop<false /*set_dvalid*/>(math_format, LOOP_FACTOR, TILE_CNT, num_faces, TEST_FACE_R_DIM, DST_INDEX);
+            run_datacopy_transpose_loop<false /*set_dvalid*/>(math_format, LOOP_FACTOR, num_blocks, tiles_in_block, num_faces, TEST_FACE_R_DIM, DST_INDEX);
         }
         else
         {
-            run_datacopy_transpose_loop<true /*set_dvalid*/>(math_format, LOOP_FACTOR, TILE_CNT, num_faces, TEST_FACE_R_DIM, DST_INDEX);
+            run_datacopy_transpose_loop<true /*set_dvalid*/>(math_format, LOOP_FACTOR, num_blocks, tiles_in_block, num_faces, TEST_FACE_R_DIM, DST_INDEX);
         }
         PROFILER_SYNC();
     }
@@ -272,16 +283,17 @@ void run_kernel(RUNTIME_PARAMETERS params)
     const FormatConfig& formats = params.formats;
 #endif
 #ifndef SPEED_OF_LIGHT
-    const std::uint32_t LOOP_FACTOR     = params.LOOP_FACTOR;
-    const std::uint32_t TILE_CNT        = params.TILE_CNT;
-    const std::uint32_t num_faces       = params.num_faces;
-    const std::uint32_t TEST_FACE_C_DIM = params.TEST_FACE_C_DIM;
-    const std::uint32_t TEST_FACE_R_DIM = params.TEST_FACE_R_DIM;
-    const int DST_INDEX                 = params.DST_INDEX;
-    const Operand& buffer_Res           = params.buffer_Res;
+    const std::uint32_t LOOP_FACTOR           = params.LOOP_FACTOR;
+    const std::uint32_t output_num_blocks     = params.OUTPUT_NUM_BLOCKS;
+    const std::uint32_t output_tiles_in_block = params.OUTPUT_NUM_TILES_IN_BLOCK;
+    const std::uint32_t num_faces             = params.num_faces;
+    const std::uint32_t TEST_FACE_C_DIM       = params.TEST_FACE_C_DIM;
+    const std::uint32_t TEST_FACE_R_DIM       = params.TEST_FACE_R_DIM;
+    const int DST_INDEX                       = params.DST_INDEX;
+    const Operand& buffer_Res                 = params.buffer_Res;
 #endif
     std::uint32_t const buf_desc_id        = 8;
-    const std::uint32_t num_tiles_per_pack = TILE_CNT;
+    const std::uint32_t num_tiles_per_pack = output_tiles_in_block;
 
     {
         ZONE_SCOPED("INIT")
@@ -331,15 +343,21 @@ void run_kernel(RUNTIME_PARAMETERS params)
             // No dest-dvalid section_done: WH/BH isolate packs without math handshake.
             for (std::uint32_t loop = 0; loop < LOOP_FACTOR; loop++)
             {
-                _llk_pack_(DST_INDEX, 0 /*start_l1_tile_idx*/, ckernel::DEFAULT_TENSOR_SHAPE);
+                for (std::uint32_t block = 0; block < output_num_blocks; block++)
+                {
+                    _llk_pack_(DST_INDEX, block * output_tiles_in_block /*start_l1_tile_idx*/, ckernel::DEFAULT_TENSOR_SHAPE);
+                }
             }
         }
         else
         {
             for (std::uint32_t loop = 0; loop < LOOP_FACTOR; loop++)
             {
-                _llk_pack_(DST_INDEX, 0 /*start_l1_tile_idx*/, ckernel::DEFAULT_TENSOR_SHAPE);
-                _llk_pack_dest_dvalid_section_done_<dest_sync, is_fp32_dest_acc_en>();
+                for (std::uint32_t block = 0; block < output_num_blocks; block++)
+                {
+                    _llk_pack_(DST_INDEX, block * output_tiles_in_block /*start_l1_tile_idx*/, ckernel::DEFAULT_TENSOR_SHAPE);
+                    _llk_pack_dest_dvalid_section_done_<dest_sync, is_fp32_dest_acc_en>();
+                }
             }
         }
         PROFILER_SYNC();
