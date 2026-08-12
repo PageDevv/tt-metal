@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
-import os
 import sys
 
 import torch
@@ -774,17 +773,9 @@ class TTSampling(LightweightModule):
                     num_buffers_per_channel=2,
                     subdevice_id=ag_sub_device_id,
                 )
-                if os.environ.get("TT_SAMPLING_DEBUG_ADDR") == "1":
-                    logger.info(f"force-argmax gather out addr {x.buffer_address():#x}")
-                if os.environ.get("QWEN_SAMPLING_KEEP_GATHERED") == "1":
-                    # Keep a handle to the gathered logits so tests can read the trace-resident
-                    # buffer back after replay and diff its slots against host-composed logits.
-                    self.debug_gathered = x
             if slice_valid_vocab:
                 x = self._slice_valid_vocab_for_argmax(x)
             x_untilized = ttnn.untilize(x, use_multicore=True, sub_core_grids=self._force_argmax_sub_core_grids)
-            if os.environ.get("QWEN_SAMPLING_KEEP_GATHERED") == "1":
-                self.debug_untilized = x_untilized
             tt_out_tok = ttnn.argmax(
                 x_untilized,
                 dim=-1,
