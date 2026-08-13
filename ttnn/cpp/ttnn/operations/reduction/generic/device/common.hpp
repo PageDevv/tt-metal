@@ -194,12 +194,14 @@ tt::tt_metal::TensorSpec build_reduce_output_tensor_spec(
     tt::tt_metal::Layout output_layout = tt::tt_metal::Layout::TILE);
 
 // Enforces the documented contract that, for reduction-style ops, any sharded
-// participant (input or output) must live in L1.  Sharded layouts and DRAM
-// buffers use disjoint coordinate spaces (worker cores vs DRAM bank cores), so
-// silently borrowing a grid across buffer types — as the shard-spec fallback
-// in `build_reduce_output_tensor_spec` would otherwise allow — produces an
-// invalid spec.  Pass an `op_name` (e.g. "reduce", "Std/Var reduction") for a
-// readable error message.
+// participant (input or output) must live in L1 or DRAM.  Sharded layouts and
+// DRAM buffers use disjoint coordinate spaces (worker cores vs DRAM bank
+// cores) — `build_reduce_output_tensor_spec` guards against silently
+// borrowing a grid across buffer types, and tt_metal's
+// `validate_buffer_parameters` enforces DRAM's 1D, row-y=0 bank-grid
+// constraint at buffer creation time, so this function only needs to reject
+// buffer types that support neither.  Pass an `op_name` (e.g. "reduce",
+// "Std/Var reduction") for a readable error message.
 void validate_reduce_sharded_buffer_types(
     const tt::tt_metal::MemoryConfig& input_mem_config,
     const tt::tt_metal::MemoryConfig& output_mem_config,

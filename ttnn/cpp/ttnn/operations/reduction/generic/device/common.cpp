@@ -211,6 +211,17 @@ tt::tt_metal::TensorSpec build_reduce_output_tensor_spec(
             if (legacy) {
                 return {legacy->grid, legacy->orientation};
             }
+            // Falling back to the input's grid is only valid when the output shares the input's
+            // buffer type: DRAM shard grids are bank ids (1D, row y=0) while L1 shard grids are
+            // worker-core (x,y) coordinates, so borrowing across buffer types would silently pair
+            // a buffer type with a grid from the wrong coordinate space.
+            TT_FATAL(
+                output_mem_config.buffer_type() == input_mem_config.buffer_type(),
+                "Sharded memory layout {} on an output with buffer type {} requires an explicit "
+                "shard_spec (cannot fall back to the input tensor's {} shard grid)",
+                mem_layout,
+                output_mem_config.buffer_type(),
+                input_mem_config.buffer_type());
             if (input_nd) {
                 return {input_nd->grid, input_nd->orientation};
             }
@@ -249,6 +260,16 @@ tt::tt_metal::TensorSpec build_reduce_output_tensor_spec(
             nd_shard_spec.has_value() || input_nd_shard_spec.has_value(),
             "ND_SHARDED memory layout requires nd_shard_spec to be set "
             "on the output memory config or the input tensor");
+        if (!nd_shard_spec.has_value()) {
+            // Same cross-buffer-type hazard as the legacy-sharding fallback above: an ND shard
+            // grid borrowed from the input is only valid for an output of the same buffer type.
+            TT_FATAL(
+                output_mem_config.buffer_type() == input_mem_config.buffer_type(),
+                "ND_SHARDED memory layout on an output with buffer type {} requires an explicit "
+                "nd_shard_spec (cannot fall back to the input tensor's {} shard grid)",
+                output_mem_config.buffer_type(),
+                input_mem_config.buffer_type());
+        }
         auto nd_shard_spec_copy = nd_shard_spec.has_value() ? *nd_shard_spec : *input_nd_shard_spec;
         if (reduce_dim == ReduceOpDim::W || reduce_dim == ReduceOpDim::HW) {
             nd_shard_spec_copy.shard_shape[-1] = 1;
@@ -272,14 +293,14 @@ void validate_reduce_sharded_buffer_types(
     const tt::tt_metal::MemoryConfig& output_mem_config,
     std::string_view op_name) {
     TT_FATAL(
-        !output_mem_config.is_sharded() || output_mem_config.is_l1(),
-        "{}: sharded output memory layout {} is only supported with L1 buffers, got buffer type {}",
+        !output_mem_config.is_sharded() || output_mem_config.is_l1() || output_mem_config.is_dram(),
+        "{}: sharded output memory layout {} is only supported with L1 or DRAM buffers, got buffer type {}",
         op_name,
         output_mem_config.memory_layout(),
         output_mem_config.buffer_type());
     TT_FATAL(
-        !input_mem_config.is_sharded() || input_mem_config.is_l1(),
-        "{}: sharded input memory layout {} is only supported with L1 buffers, got buffer type {}",
+        !input_mem_config.is_sharded() || input_mem_config.is_l1() || input_mem_config.is_dram(),
+        "{}: sharded input memory layout {} is only supported with L1 or DRAM buffers, got buffer type {}",
         op_name,
         input_mem_config.memory_layout(),
         input_mem_config.buffer_type());
