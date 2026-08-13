@@ -153,6 +153,10 @@ class ProfilerData:
         """Filter: Pack thread data"""
         return ProfilerData(self.df, self.mask & (self.df["thread"] == "pack"))
 
+    def sfpu(self) -> "ProfilerData":
+        """Filter: SFPU thread data"""
+        return ProfilerData(self.df, self.mask & (self.df["thread"] == "sfpu"))
+
     # Filter by type
     def zones(self) -> "ProfilerData":
         """Filter: Profiler zones"""
@@ -254,6 +258,69 @@ def _stats_l1_to_l1(data: ProfilerData) -> pd.DataFrame:
     return _stats_timings(pd.concat(timings, ignore_index=True))
 
 
+def _parallel_zone_entries(
+    group: pd.DataFrame, thread: str, entry_type: str
+) -> pd.DataFrame:
+    return group[
+        (group["thread"] == thread) & (group["type"] == entry_type)
+    ].reset_index(drop=True)
+
+
+def _stats_l1_to_l1_parallel(data: ProfilerData) -> pd.DataFrame:
+    raw_data = data.zones().raw()
+    if raw_data.empty:
+        return pd.DataFrame()
+
+    if raw_data["run_index"].isna().any():
+        raise ValueError(
+            "run_index must be explicitly set before computing parallel stats"
+        )
+
+    timings = []
+    for (marker, run_index), group in raw_data.groupby([MARKER, "run_index"]):
+        fpu_start = _parallel_zone_entries(group, "unpack", "ZONE_START")
+        fpu_end = _parallel_zone_entries(group, "pack", "ZONE_END")
+        sfpu_start = _parallel_zone_entries(group, "sfpu", "ZONE_START")
+        sfpu_end = _parallel_zone_entries(group, "sfpu", "ZONE_END")
+
+        counts = {
+            "fpu_start": len(fpu_start),
+            "fpu_end": len(fpu_end),
+            "sfpu_start": len(sfpu_start),
+            "sfpu_end": len(sfpu_end),
+        }
+        if not counts["fpu_start"] or len(set(counts.values())) != 1:
+            raise ValueError(
+                "FPU and SFPU zones must be present and paired for "
+                f"L1_TO_L1_PARALLEL (marker={marker}, run_index={run_index}, "
+                f"counts={counts})"
+            )
+
+        fpu_duration = fpu_end["timestamp"] - fpu_start["timestamp"]
+        sfpu_duration = sfpu_end["timestamp"] - sfpu_start["timestamp"]
+        overall_start = pd.concat(
+            [fpu_start["timestamp"], sfpu_start["timestamp"]], axis=1
+        ).min(axis=1)
+        overall_end = pd.concat(
+            [fpu_end["timestamp"], sfpu_end["timestamp"]], axis=1
+        ).max(axis=1)
+
+        timings.append(
+            pd.DataFrame(
+                {
+                    MARKER: marker,
+                    f"{PerfRunType.L1_TO_L1_PARALLEL.name}[FPU]": fpu_duration,
+                    f"{PerfRunType.L1_TO_L1_PARALLEL.name}[SFPU]": sfpu_duration,
+                    f"{PerfRunType.L1_TO_L1_PARALLEL.name}[OVERALL]": (
+                        overall_end - overall_start
+                    ),
+                }
+            )
+        )
+
+    return _stats_timings(pd.concat(timings, ignore_index=True))
+
+
 def _stats_thread(stat: str, raw_thread: pd.DataFrame) -> pd.DataFrame:
     # WC build emits no zone events — skip wall_clock stats, counters provide values instead.
     if raw_thread.empty:
@@ -290,6 +357,10 @@ def _stats_math_isolate(data: ProfilerData) -> pd.DataFrame:
 
 def _stats_pack_isolate(data: ProfilerData) -> pd.DataFrame:
     return _stats_thread(PerfRunType.PACK_ISOLATE.name, data.pack().raw())
+
+
+def _stats_sfpu_isolate(data: ProfilerData) -> pd.DataFrame:
+    return _stats_thread(PerfRunType.SFPU_ISOLATE.name, data.sfpu().raw())
 
 
 def _stats_l1_congestion(data: ProfilerData) -> pd.DataFrame:
@@ -338,9 +409,11 @@ class Profiler:
     # === Stats functions ===
     STATS_FUNCTION = {
         PerfRunType.L1_TO_L1: _stats_l1_to_l1,
+        PerfRunType.L1_TO_L1_PARALLEL: _stats_l1_to_l1_parallel,
         PerfRunType.UNPACK_ISOLATE: _stats_unpack_isolate,
         PerfRunType.MATH_ISOLATE: _stats_math_isolate,
         PerfRunType.PACK_ISOLATE: _stats_pack_isolate,
+        PerfRunType.SFPU_ISOLATE: _stats_sfpu_isolate,
         PerfRunType.L1_CONGESTION: _stats_l1_congestion,
     }
     SUPPORTED_RUNS = STATS_FUNCTION.keys()

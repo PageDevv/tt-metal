@@ -71,9 +71,11 @@ ALL_PERF_RUN_TYPES = [
 # Run-type → kernel components for the ELF_SIZE column. L1_CONGESTION omitted.
 _CODE_SIZE_COMPONENTS = {
     PerfRunType.L1_TO_L1: ["unpack", "math", "pack"],
+    PerfRunType.L1_TO_L1_PARALLEL: ["unpack", "math", "pack", "sfpu"],
     PerfRunType.UNPACK_ISOLATE: ["unpack"],
     PerfRunType.MATH_ISOLATE: ["math"],
     PerfRunType.PACK_ISOLATE: ["pack"],
+    PerfRunType.SFPU_ISOLATE: ["sfpu"],
 }
 
 # Common postprocessing
@@ -839,7 +841,11 @@ class PerfConfig(TestConfig):
 
 
 def create_test_or_perf_config(
-    *, is_perf: bool, run_types: list[PerfRunType], test_config_kwargs: dict
+    *,
+    is_perf: bool,
+    run_types: list[PerfRunType],
+    test_config_kwargs: dict,
+    functional_run_type: PerfRunType = PerfRunType.L1_TO_L1,
 ) -> TestConfig:
     """Create the common functional or performance configuration.
 
@@ -853,6 +859,6 @@ def create_test_or_perf_config(
         **{
             **test_config_kwargs,
             "templates": test_config_kwargs["templates"]
-            + [PERF_RUN_TYPE(PerfRunType.L1_TO_L1)],
+            + [PERF_RUN_TYPE(functional_run_type)],
         }
     )

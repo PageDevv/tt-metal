@@ -723,6 +723,8 @@ class PerfRunType(Enum):
     MATH_ISOLATE = 3
     PACK_ISOLATE = 4
     L1_CONGESTION = 5
+    L1_TO_L1_PARALLEL = 6
+    SFPU_ISOLATE = 7
 
 
 # Single pytest case runs every PerfRunType so the module CSV has one
@@ -735,6 +737,21 @@ PERF_RUN_TYPES_QUASAR = [
         PerfRunType.MATH_ISOLATE,
         PerfRunType.PACK_ISOLATE,
         PerfRunType.L1_CONGESTION,
+    ],
+]
+
+# Four-TRISC tests use two additional modes that existing Quasar kernels do not
+# implement. Keep these modes in a dedicated list rather than changing the
+# schema of every Quasar perf test.
+PERF_RUN_TYPES_QUASAR_4_TRISC = [
+    [
+        PerfRunType.L1_TO_L1_PARALLEL,
+        PerfRunType.L1_TO_L1,
+        PerfRunType.UNPACK_ISOLATE,
+        PerfRunType.MATH_ISOLATE,
+        PerfRunType.PACK_ISOLATE,
+        PerfRunType.L1_CONGESTION,
+        PerfRunType.SFPU_ISOLATE,
     ],
 ]
 PERF_LOOP_FACTOR_QUASAR = 32
