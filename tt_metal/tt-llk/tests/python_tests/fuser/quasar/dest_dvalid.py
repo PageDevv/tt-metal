@@ -22,32 +22,30 @@ PACK_THREAD = "pack"
 SFPU_THREAD = "isolate_sfpu"
 
 
+CHAIN_ORDER = (UNPACK, FPU, SFPU, PACK)
+
+
+def chain(pipeline: "ComputePipeline") -> List[str]:
+    clients = set()
+
+    for node in pipeline.math_nodes:
+        if isinstance(node, SfpuNode):
+            clients.add(SFPU)
+        elif node.unpack_to_dest.value:
+            clients.add(UNPACK)
+        else:
+            clients.add(FPU)
+
+    for node in pipeline.pack_nodes:
+        clients.add(SFPU if isinstance(node, SfpuNode) else PACK)
+
+    return [client for client in CHAIN_ORDER if client in clients]
+
+
 def _sfpu_thread(pipeline: "ComputePipeline") -> str:
     if any(isinstance(node, SfpuNode) for node in pipeline.pack_nodes):
         return PACK_THREAD
     return MATH_THREAD
-
-
-def chain(pipeline: "ComputePipeline") -> List[str]:
-    clients = []
-
-    for node in pipeline.math_nodes:
-        if isinstance(node, SfpuNode):
-            clients.append(SFPU)
-        elif node.unpack_to_dest.value:
-            clients.append(UNPACK)
-        else:
-            clients.append(FPU)
-
-    for node in pipeline.pack_nodes:
-        clients.append(SFPU if isinstance(node, SfpuNode) else PACK)
-
-    ordered = []
-    for client in clients:
-        if client not in ordered:
-            ordered.append(client)
-
-    return ordered if len(ordered) > 1 else []
 
 
 def clients_of(pipeline: "ComputePipeline", thread: str) -> List[str]:
@@ -66,25 +64,21 @@ def enable(config: "GlobalConfig", operation: "L1Operation", thread: str) -> str
     if not config.quasar_use_dvalid:
         return ""
 
-    order = chain(operation.math)
-    clients = clients_of(operation.math, thread)
+    members = chain(operation.math)
+    owned = clients_of(operation.math, thread)
+    enabled = [client for client in owned if client in members]
+    code = ""
 
-    code = "".join(
-        f"_llk_dest_dvalid_disable_<dest_dvalid_client::{client}>();\n"
-        for client in clients
-        if client not in order
-    )
+    for client in CHAIN_ORDER:
+        if client in owned:
+            if client not in members:
+                code += f"_llk_dest_dvalid_disable_<dest_dvalid_client::{client}>();\n"
+        elif enabled:
+            call = "include" if client in members else "exclude"
+            code += f"_llk_dest_dvalid_{call}_<dest_dvalid_client::{client}>();\n"
 
-    for client in clients:
-        if client not in order:
-            continue
-
-        index = order.index(client)
-        next_client = order[(index + 1) % len(order)]
-        code += (
-            f"_llk_dest_dvalid_enable_<dest_dvalid_client::{client}, "
-            f"dest_dvalid_client::{next_client}, {'true' if index == 0 else 'false'}>();\n"
-        )
+    for client in enabled:
+        code += f"_llk_dest_dvalid_enable_<dest_dvalid_client::{client}>();\n"
 
     return code
 
@@ -93,11 +87,11 @@ def disable(config: "GlobalConfig", operation: "L1Operation", thread: str) -> st
     if not config.quasar_use_dvalid or not operation.is_last_stage:
         return ""
 
-    order = chain(operation.math)
+    members = chain(operation.math)
     return "".join(
         f"_llk_dest_dvalid_disable_<dest_dvalid_client::{client}>();\n"
         for client in clients_of(operation.math, thread)
-        if client in order
+        if client in members
     )
 
 

@@ -20,62 +20,122 @@ enum class dest_dvalid_client : std::uint32_t
     PACK   = 3,
 };
 
-constexpr std::uint32_t dest_dvalid_bit(dest_dvalid_client client)
+struct dest_dvalid_config
 {
-    return 1u << static_cast<std::uint32_t>(client);
-}
+    std::uint32_t ctrl_addr32;
+    std::uint32_t bit;
+    std::uint32_t drain_res;
+};
 
-constexpr std::uint32_t dest_dvalid_ctrl_addr32(dest_dvalid_client client)
-{
-    return UNPACK_TO_DEST_DVALID_CTRL_wait_mask_ADDR32 + static_cast<std::uint32_t>(client);
-}
+constexpr dest_dvalid_config dest_dvalid_configs[] = {
+    {UNPACK_TO_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::UNPACK_TO_DEST, p_stall::UNPACK0},
+    {MATH_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::FPU, p_stall::NOTHING},
+    {SFPU_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::SFPU, p_stall::NOTHING},
+    {PACK_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::PACK, p_stall::PACK},
+};
 
-constexpr std::uint32_t dest_dvalid_idle_res(dest_dvalid_client client)
-{
-    return (client == dest_dvalid_client::UNPACK) ? p_stall::UNPACK0 : (client == dest_dvalid_client::PACK) ? p_stall::PACK : p_stall::NOTHING;
-}
+template <dest_dvalid_client CLIENT>
+constexpr dest_dvalid_config dest_dvalid_config_of = dest_dvalid_configs[to_underlying(CLIENT)];
 
-constexpr std::uint32_t DEST_DVALID_ALL_BITS = dest_dvalid_bit(dest_dvalid_client::UNPACK) | dest_dvalid_bit(dest_dvalid_client::FPU) |
-                                               dest_dvalid_bit(dest_dvalid_client::SFPU) | dest_dvalid_bit(dest_dvalid_client::PACK);
+constexpr std::uint32_t DEST_DVALID_ALL_CLIENTS =
+    dest_dvalid_configs[0].bit | dest_dvalid_configs[1].bit | dest_dvalid_configs[2].bit | dest_dvalid_configs[3].bit;
 
 constexpr std::uint32_t DEST_DVALID_CTRL_MASK = UNPACK_TO_DEST_DVALID_CTRL_wait_mask_MASK | UNPACK_TO_DEST_DVALID_CTRL_wait_polarity_MASK |
                                                 UNPACK_TO_DEST_DVALID_CTRL_toggle_mask_MASK | UNPACK_TO_DEST_DVALID_CTRL_disable_auto_bank_id_toggle_MASK;
 
-static_assert(dest_dvalid_bit(dest_dvalid_client::UNPACK) == p_cleardvalid::UNPACK_TO_DEST);
-static_assert(dest_dvalid_bit(dest_dvalid_client::FPU) == p_cleardvalid::FPU);
-static_assert(dest_dvalid_bit(dest_dvalid_client::SFPU) == p_cleardvalid::SFPU);
-static_assert(dest_dvalid_bit(dest_dvalid_client::PACK) == p_cleardvalid::PACK);
-
-static_assert(MATH_DEST_DVALID_CTRL_wait_mask_ADDR32 == UNPACK_TO_DEST_DVALID_CTRL_wait_mask_ADDR32 + 1);
-static_assert(SFPU_DEST_DVALID_CTRL_wait_mask_ADDR32 == UNPACK_TO_DEST_DVALID_CTRL_wait_mask_ADDR32 + 2);
-static_assert(PACK_DEST_DVALID_CTRL_wait_mask_ADDR32 == UNPACK_TO_DEST_DVALID_CTRL_wait_mask_ADDR32 + 3);
+static_assert(MATH_DEST_DVALID_CTRL_wait_polarity_SHAMT == UNPACK_TO_DEST_DVALID_CTRL_wait_polarity_SHAMT);
 static_assert(MATH_DEST_DVALID_CTRL_toggle_mask_SHAMT == UNPACK_TO_DEST_DVALID_CTRL_toggle_mask_SHAMT);
 static_assert(PACK_DEST_DVALID_CTRL_toggle_mask_MASK == UNPACK_TO_DEST_DVALID_CTRL_toggle_mask_MASK);
 
-template <dest_dvalid_client CLIENT, dest_dvalid_client NEXT, bool IS_FIRST = false>
+static std::uint32_t dest_dvalid_chain = DEST_DVALID_ALL_CLIENTS;
+
+constexpr std::uint32_t dest_dvalid_lowest(std::uint32_t mask)
+{
+    return mask & (~mask + 1);
+}
+
+inline std::uint32_t dest_dvalid_successor(std::uint32_t bit)
+{
+    const std::uint32_t after = dest_dvalid_chain & ~((bit << 1) - 1);
+    return dest_dvalid_lowest(after != 0 ? after : dest_dvalid_chain);
+}
+
+template <dest_dvalid_client CLIENT>
+inline void dest_dvalid_wait_client_idle()
+{
+    wait_mop_idle();
+
+    if constexpr (CLIENT == dest_dvalid_client::UNPACK)
+    {
+        wait_unpack_idle();
+    }
+    else if constexpr (CLIENT == dest_dvalid_client::FPU)
+    {
+        wait_fpu_idle();
+    }
+    else if constexpr (CLIENT == dest_dvalid_client::SFPU)
+    {
+        wait_sfpu_idle();
+    }
+    else
+    {
+        wait_pack_idle();
+    }
+}
+
+inline void dest_dvalid_wait_chain_idle()
+{
+    bstatus_u busy;
+    busy.val         = 0;
+    busy.global_fpu  = 1;
+    busy.global_sfpu = 1;
+    busy.global_pack = 1;
+    wait_bstatus_low(busy.val);
+}
+
+template <dest_dvalid_client CLIENT>
+inline void _llk_dest_dvalid_include_()
+{
+    dest_dvalid_chain |= dest_dvalid_config_of<CLIENT>.bit;
+}
+
+template <dest_dvalid_client CLIENT>
+inline void _llk_dest_dvalid_exclude_()
+{
+    dest_dvalid_chain &= ~dest_dvalid_config_of<CLIENT>.bit;
+}
+
+template <dest_dvalid_client CLIENT>
 inline void _llk_dest_dvalid_enable_()
 {
-    static_assert(CLIENT != NEXT, "A dest dvalid chain has to hand its sections over to another client");
+    constexpr dest_dvalid_config CFG = dest_dvalid_config_of<CLIENT>;
 
-    constexpr std::uint32_t OWN_BIT       = dest_dvalid_bit(CLIENT);
-    constexpr std::uint32_t WAIT_MASK     = IS_FIRST ? DEST_DVALID_ALL_BITS : OWN_BIT;
-    constexpr std::uint32_t WAIT_POLARITY = IS_FIRST ? 0u : OWN_BIT;
-    constexpr std::uint32_t TOGGLE_MASK   = OWN_BIT | dest_dvalid_bit(NEXT);
+    dest_dvalid_chain |= CFG.bit;
+    dest_dvalid_wait_client_idle<CLIENT>();
 
-    constexpr std::uint32_t CTRL = (WAIT_MASK << UNPACK_TO_DEST_DVALID_CTRL_wait_mask_SHAMT) |
-                                   (WAIT_POLARITY << UNPACK_TO_DEST_DVALID_CTRL_wait_polarity_SHAMT) |
-                                   (TOGGLE_MASK << UNPACK_TO_DEST_DVALID_CTRL_toggle_mask_SHAMT);
+    const bool is_first = dest_dvalid_lowest(dest_dvalid_chain) == CFG.bit;
+    if (is_first)
+    {
+        dest_dvalid_wait_chain_idle();
+    }
 
-    cfg_rmw(dest_dvalid_ctrl_addr32(CLIENT), 0, DEST_DVALID_CTRL_MASK, CTRL);
+    const std::uint32_t wait_mask     = is_first ? DEST_DVALID_ALL_CLIENTS : CFG.bit;
+    const std::uint32_t wait_polarity = is_first ? 0u : CFG.bit;
+    const std::uint32_t toggle_mask   = CFG.bit | dest_dvalid_successor(CFG.bit);
+
+    const std::uint32_t ctrl = (wait_mask << UNPACK_TO_DEST_DVALID_CTRL_wait_mask_SHAMT) | (wait_polarity << UNPACK_TO_DEST_DVALID_CTRL_wait_polarity_SHAMT) |
+                               (toggle_mask << UNPACK_TO_DEST_DVALID_CTRL_toggle_mask_SHAMT);
+
+    cfg_rmw(CFG.ctrl_addr32, 0, DEST_DVALID_CTRL_MASK, ctrl);
     TTI_STALLWAIT(p_stall::STALL_THREAD, p_stall::NOTHING, p_stall::CFGEXU, p_stall::TRISC_CFG);
 }
 
 template <dest_dvalid_client CLIENT, DstSync DST, bool EN_32BIT_DEST = false>
 inline void _llk_dest_dvalid_signal_()
 {
-    constexpr std::uint32_t CLIENT_SEL = dest_dvalid_bit(CLIENT);
+    constexpr dest_dvalid_config CFG = dest_dvalid_config_of<CLIENT>;
 
-    TTI_STALLWAIT(p_stall::STALL_MATH, p_stall::NOTHING, p_stall::WAIT_SFPU, dest_dvalid_idle_res(CLIENT));
+    TTI_STALLWAIT(p_stall::STALL_MATH, p_stall::NOTHING, p_stall::WAIT_SFPU, CFG.drain_res);
 
     if constexpr (CLIENT == dest_dvalid_client::PACK)
     {
@@ -90,10 +150,10 @@ inline void _llk_dest_dvalid_signal_()
         }
     }
 
-    TTI_CLEARDVALID(0, 0, 0, 0, CLIENT_SEL, 0);
+    TTI_CLEARDVALID(0, 0, 0, 0, CFG.bit, 0);
     if constexpr (DST == DstSync::SyncFull)
     {
-        TTI_CLEARDVALID(0, 0, 0, CLIENT_SEL, CLIENT_SEL, 0);
+        TTI_CLEARDVALID(0, 0, 0, CFG.bit, CFG.bit, 0);
     }
 
     if constexpr (CLIENT == dest_dvalid_client::PACK && DST == DstSync::SyncHalf)
@@ -105,9 +165,14 @@ inline void _llk_dest_dvalid_signal_()
 template <dest_dvalid_client CLIENT>
 inline void _llk_dest_dvalid_disable_()
 {
-    TTI_STALLWAIT(p_stall::STALL_MATH | p_stall::STALL_CFG, p_stall::NOTHING, p_stall::WAIT_SFPU, dest_dvalid_idle_res(CLIENT));
-    TTI_CLEARDVALID(0, 0, 0, dest_dvalid_bit(CLIENT), 0, 0);
-    cfg_rmw(dest_dvalid_ctrl_addr32(CLIENT), 0, DEST_DVALID_CTRL_MASK, 0);
+    constexpr dest_dvalid_config CFG = dest_dvalid_config_of<CLIENT>;
+
+    dest_dvalid_chain &= ~CFG.bit;
+
+    TTI_STALLWAIT(p_stall::STALL_MATH | p_stall::STALL_CFG, p_stall::NOTHING, p_stall::WAIT_SFPU, CFG.drain_res);
+    dest_dvalid_wait_client_idle<CLIENT>();
+    TTI_CLEARDVALID(0, 0, 0, CFG.bit, 0, 0);
+    cfg_rmw(CFG.ctrl_addr32, 0, DEST_DVALID_CTRL_MASK, 0);
 }
 
 } // namespace ckernel
