@@ -790,7 +790,8 @@ Tensor rsub(
     const std::optional<Tensor>& optional_output_tensor,
     ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
     ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
-    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations,
+    const std::optional<bool>& fast_and_approximate_mode) {
     return ttnn::detail::invoke_binary_ng(
         input_tensor_a,
         input_tensor_b,
@@ -800,7 +801,10 @@ Tensor rsub(
         optional_output_tensor,
         post_activations,
         lhs_activations,
-        rhs_activations);
+        rhs_activations,
+        ttnn::detail::resolve_fast_and_approximate_mode(
+            fast_and_approximate_mode,
+            is_block_float(input_tensor_a.dtype()) || is_block_float(input_tensor_b.dtype())));
 }
 
 Tensor rsub(
@@ -811,7 +815,8 @@ Tensor rsub(
     const std::optional<Tensor>& optional_output_tensor,
     ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
     ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
-    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations,
+    const std::optional<bool>& fast_and_approximate_mode) {
     return ttnn::detail::invoke_binary_ng(
         input_tensor_a,
         input_b,
@@ -821,7 +826,9 @@ Tensor rsub(
         optional_output_tensor,
         post_activations,
         lhs_activations,
-        rhs_activations);
+        rhs_activations,
+        ttnn::detail::resolve_fast_and_approximate_mode(
+            fast_and_approximate_mode, is_block_float(input_tensor_a.dtype())));
 }
 
 Tensor bias_gelu(
@@ -879,6 +886,7 @@ Tensor bias_gelu(
             {},
             {},
             {},
+            /*fast_and_approximate_mode*/ std::nullopt,
             resolved_sub_core_grids),
         true,
         memory_config,
