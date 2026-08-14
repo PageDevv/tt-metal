@@ -104,17 +104,19 @@ void run_kernel(RUNTIME_PARAMETERS params)
         }
         else if constexpr (PERF_RUN_TYPE == PerfRunType::MATH_ISOLATE)
         {
-            // Real unpack produces all SrcA tiles first, then the dummy SrcB
-            // tiles consumed by transpose. Preserve that ordering: the two
-            // MOPs cannot be mocked as one simultaneous SrcAB handshake.
-            const std::uint32_t tiles_per_loop = num_blocks * tiles_in_block;
             for (std::uint32_t loop = 0; loop < LOOP_FACTOR; loop++)
             {
-                if constexpr (!unpack_to_dest)
+                // Match real unpack's per-block ordering. Batching all SrcA
+                // blocks before SrcB deadlocks once the test spans multiple
+                // DEST blocks because math consumes SrcA then SrcB per block.
+                for (std::uint32_t block = 0; block < num_blocks; block++)
                 {
-                    _perf_unpack_loop_set_valid<true /*set_a*/, false /*set_b*/>(tiles_per_loop);
+                    if constexpr (!unpack_to_dest)
+                    {
+                        _perf_unpack_loop_set_valid<true /*set_a*/, false /*set_b*/>(tiles_in_block);
+                    }
+                    _perf_unpack_loop_set_valid<false /*set_a*/, true /*set_b*/>(tiles_in_block);
                 }
-                _perf_unpack_loop_set_valid<false /*set_a*/, true /*set_b*/>(tiles_per_loop);
             }
         }
         else
@@ -246,15 +248,19 @@ void run_kernel(RUNTIME_PARAMETERS params)
         }
         else if constexpr (PERF_RUN_TYPE == PerfRunType::UNPACK_ISOLATE || PERF_RUN_TYPE == PerfRunType::L1_CONGESTION)
         {
-            // Real unpack emits SrcA and dummy SrcB as two ordered batches.
-            const std::uint32_t tiles_per_loop = num_blocks * tiles_in_block;
             for (std::uint32_t loop = 0; loop < LOOP_FACTOR; loop++)
             {
-                if constexpr (!unpack_to_dest)
+                // Real unpack emits SrcA then dummy SrcB for each block.
+                // Clearing all SrcA blocks first waits on data that unpack
+                // cannot produce until the preceding SrcB block is consumed.
+                for (std::uint32_t block = 0; block < num_blocks; block++)
                 {
-                    _perf_math_loop_clear_valid<true /*clear_a*/, false /*clear_b*/>(tiles_per_loop);
+                    if constexpr (!unpack_to_dest)
+                    {
+                        _perf_math_loop_clear_valid<true /*clear_a*/, false /*clear_b*/>(tiles_in_block);
+                    }
+                    _perf_math_loop_clear_valid<false /*clear_a*/, true /*clear_b*/>(tiles_in_block);
                 }
-                _perf_math_loop_clear_valid<false /*clear_a*/, true /*clear_b*/>(tiles_per_loop);
             }
         }
         else if constexpr (PERF_RUN_TYPE == PerfRunType::MATH_ISOLATE)
