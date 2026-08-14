@@ -124,7 +124,7 @@ def _has_perfconfig(tree) -> bool:
     return any(
         isinstance(n, ast.Call)
         and isinstance(n.func, ast.Name)
-        and n.func.id == "PerfConfig"
+        and n.func.id in {"PerfConfig", "create_test_or_perf_config"}
         for n in ast.walk(tree)
     )
 
