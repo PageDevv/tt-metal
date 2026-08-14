@@ -35,7 +35,7 @@ from helpers.param_config import (
     parametrize,
     runtime,
 )
-from helpers.perf import create_test_or_perf_config
+from helpers.perf.core import create_test_or_perf_config
 from helpers.stimuli_config import StimuliConfig
 from helpers.stimuli_generator import StimuliSpec, generate_stimuli
 from helpers.test_variant_parameters import (
@@ -165,6 +165,7 @@ def test_sfpu_exp_parallel_matmul_quasar(
         spec_B=exp_spec,
         output_format=formats.output_format,
     )
+
     src_exp = prepare_inputs_for_operation(
         src_exp, MathOperation.Exp, formats.input_format, formats.output_format
     )

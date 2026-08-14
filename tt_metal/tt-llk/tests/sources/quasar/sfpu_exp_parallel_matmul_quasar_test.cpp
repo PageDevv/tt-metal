@@ -158,12 +158,13 @@ void run_kernel(RUNTIME_PARAMETERS params)
 
 #ifdef LLK_TRISC_ISOLATE_SFPU
 
-#include "cfg_defines.h"
+#include "ckernel_template.h"
 #include "cmath_common.h"
 #include "llk_math_common.h"
 #include "llk_math_eltwise_unary_sfpu.h"
 #include "llk_srcs.h"
 #include "params.h"
+#include "sfpu/ckernel_sfpu_exp.h"
 
 using namespace ckernel;
 using namespace ckernel::math;
@@ -172,7 +173,7 @@ using namespace ckernel::sfpu;
 void run_kernel(RUNTIME_PARAMETERS params)
 {
 #if defined(RUNTIME_FORMATS) && !defined(SPEED_OF_LIGHT)
-    const volatile FormatConfig& formats = params.formats;
+    const FormatConfig& formats = params.formats;
 #endif
     const std::uint32_t num_tiles   = params.TILE_CNT;
     const std::uint32_t LOOP_FACTOR = params.LOOP_FACTOR;
@@ -186,6 +187,13 @@ void run_kernel(RUNTIME_PARAMETERS params)
 
     constexpr std::uint32_t buf_desc_id_unpack = 0;
     constexpr std::uint32_t buf_desc_id_pack   = 8;
+
+    const int num_sfpu_iterations = PARAM_SRCS_YDIM >> 1;
+    const int load_base_addr      = ckernel::math::SFPU_SRCS_BASE_ADDR;
+
+    const std::uint32_t load_sfpmem  = _sfpu_sfpmem_type_(static_cast<DataFormat>(formats.unpack_S_dst));
+    const std::uint32_t store_sfpmem = _sfpu_sfpmem_type_(static_cast<DataFormat>(formats.pack_S_src));
+    ckernel_template mop(PARAM_SRCS_SLICE_COUNT, 1, _exp_loadmacro_op_(num_sfpu_iterations));
 
     {
         ZONE_SCOPED("INIT")
@@ -216,44 +224,38 @@ void run_kernel(RUNTIME_PARAMETERS params)
         _configure_buf_desc_table_(td_pack.buf_desc_id, td_pack.buf_desc);
         _llk_pack_hw_configure_<p_pacr::PACK1, false>(td_pack, ckernel::ReluConfig::none());
 
-        cfg[DISABLE_IMPLIED_SRCS_FORMAT_ADDR32 + TRISC_ID] = !IMPLIED_MATH_FORMAT;
         _llk_unpack_srcs_config_for_tile_<PARAM_SRCS_INSTRN_COUNT>(PARAM_SRCS_32BIT_MODE);
         _llk_pack_srcs_config_for_tile_<PARAM_SRCS_INSTRN_COUNT>(PARAM_SRCS_32BIT_MODE);
         _llk_math_eltwise_sfpu_init_();
+
+        // The store offset (2 * YDIM = slice size) must be a compile-time constant.
+        if (PARAM_SRCS_32BIT_MODE)
+        {
+            _exp_init_loadmacro_<2 * srcs_dims::ydim(true)>(load_base_addr, num_sfpu_iterations, load_sfpmem, store_sfpmem);
+        }
+        else
+        {
+            _exp_init_loadmacro_<2 * srcs_dims::ydim(false)>(load_base_addr, num_sfpu_iterations, load_sfpmem, store_sfpmem);
+        }
+        mop.program(instrn_buffer);
         PROFILER_SYNC();
     }
     {
         ZONE_SCOPED("TILE_LOOP")
         if constexpr (PERF_RUN_TYPE == PerfRunType::L1_TO_L1_PARALLEL || PERF_RUN_TYPE == PerfRunType::SFPU_ISOLATE)
         {
-            const int num_sfpu_iterations = PARAM_SRCS_YDIM >> 1;
+            // Full TRISC3 path: UNP_S -> SFPU exp replay -> PACK1.
             for (std::uint32_t loop = 0; loop < LOOP_FACTOR; ++loop)
             {
                 for (std::uint32_t i = 0; i < num_tiles; ++i)
                 {
                     _llk_unpack_srcs_<PARAM_SRCS_INSTRN_COUNT>(buf_desc_id_unpack, i * PARAM_SRCS_SLICE_COUNT);
                     _llk_pack_srcs_<PARAM_SRCS_INSTRN_COUNT>(buf_desc_id_pack, i * PARAM_SRCS_SLICE_COUNT);
-
-                    for (std::uint32_t slice = 0; slice < PARAM_SRCS_SLICE_COUNT; slice++)
-                    {
-                        const int load_base_addr  = ckernel::math::SFPU_SRCS_BASE_ADDR;
-                        const int store_base_addr = ckernel::math::SFPU_SRCS_BASE_ADDR + 2 * PARAM_SRCS_YDIM;
-
-#pragma GCC unroll 8
-                        for (int d = 0; d < num_sfpu_iterations; d++)
-                        {
-                            TT_SFPLOAD(p_sfpu::LREG0, p_sfpu::sfpmem::DEFAULT, ADDR_MOD_7, 0, load_base_addr + (d << 1));
-                            TTI_SFPNONLINEAR(p_sfpu::LREG0, p_sfpu::LREG1, p_sfpnonlinear::EXP_MODE);
-                            TT_SFPSTORE(p_sfpu::LREG1, p_sfpu::sfpmem::DEFAULT, ADDR_MOD_7, 0, store_base_addr + (d << 1));
-                        }
-
-                        _llk_math_eltwise_sfpu_srcs_clear_vlds_<true, true>();
-                    }
+                    ckernel_template::run(instrn_buffer);
                 }
             }
         }
-        wait_sfpu_idle();
-        wait_unpack_idle();
+        wait_mop_idle();
         wait_pack_idle();
         PROFILER_SYNC();
     }
@@ -278,6 +280,8 @@ void run_kernel(RUNTIME_PARAMETERS params)
 
     {
         ZONE_SCOPED("INIT")
+        // PACK_ISOLATE and L1_CONGESTION pack without a math↔pack handshake.
+        // Explicitly clear wait_mask because CFG state can persist across run types.
         if constexpr (PERF_RUN_TYPE == PerfRunType::PACK_ISOLATE || PERF_RUN_TYPE == PerfRunType::L1_CONGESTION)
         {
             auto cfg                                    = (std::uint32_t volatile*)TENSIX_CFG_BASE;
