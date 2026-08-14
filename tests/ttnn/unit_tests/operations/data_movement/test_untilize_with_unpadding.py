@@ -209,6 +209,47 @@ def test_untilize_with_unpadding_height_sharded_narrow_width_regression(device, 
     assert_equal(result, torch_input)
 
 
+@pytest.mark.parametrize("dtype", [ttnn.bfloat16, ttnn.float32])
+@pytest.mark.parametrize("output_width", [30, 31, 32])
+def test_untilize_with_unpadding_interleaved_to_height_sharded_unaligned_row(device, dtype, output_width):
+    """INTERLEAVED input -> HEIGHT_SHARDED output whose row size is not a multiple of the
+    buffer alignment (16 bytes in L1).
+
+    This configuration reaches the row-split multi-core writer, which addresses the
+    destination through a sharded TensorAccessor. That accessor strides by the page size it is
+    handed, verbatim, so it must be given the buffer's aligned page size and not the unpadded
+    row size; otherwise the allocator's per-row padding is never skipped and every row after
+    the first lands short of where the reader expects it. output_width 32 (64 bytes for bf16,
+    128 for fp32) is the already-aligned control case.
+    """
+    torch.manual_seed(0)
+    shape = [1, 1, 256, 64]
+    output_end = [0, 0, 255, output_width - 1]
+    torch_input = torch.rand(shape, dtype=TTNN_TO_TORCH_DTYPE[dtype])
+
+    # Shard width tracks the unpadded output width, so the output row size in bytes stays
+    # unaligned - padding the shard out to a tile width would hide the mis-striding.
+    num_cores = 4
+    shard_core_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, num_cores - 1))})
+    output_shard_spec = ttnn.ShardSpec(
+        shard_core_grid, (shape[2] // num_cores, output_width), ttnn.ShardOrientation.ROW_MAJOR
+    )
+    output_memory_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, output_shard_spec
+    )
+
+    tile_tensor = ttnn.from_torch(
+        torch_input, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    untilized = ttnn.untilize_with_unpadding(
+        tile_tensor, output_tensor_end=output_end, memory_config=output_memory_config
+    )
+    result = ttnn.to_torch(untilized)
+
+    slices = tuple(slice(0, output_end[i] + 1) for i in range(len(output_end)))
+    assert_equal(result, torch_input[slices])
+
+
 @pytest.mark.parametrize("dtype", [ttnn.bfloat16])
 @pytest.mark.parametrize(
     "shape, output_end, shard_shape, num_cores",
