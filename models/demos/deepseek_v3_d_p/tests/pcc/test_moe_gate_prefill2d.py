@@ -24,12 +24,12 @@ from models.demos.deepseek_v3_d_p.reference.kimi_k2_6_config import KimiK26Confi
 from models.demos.deepseek_v3_d_p.reference.kimi_k3_config import KimiK3Config
 from models.demos.deepseek_v3_d_p.reference.minimax_m2_7.modeling_minimax_m2 import MiniMaxM2SparseMoeBlock
 from models.demos.deepseek_v3_d_p.reference.minimax_m2_7_config import MiniMaxM27Config
+from models.demos.deepseek_v3_d_p.tests.fabric_profiles import fabric2d_device_params, torus_xy_device_params
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import (
     GATE_KEY_PREFIX_DEEPSEEK,
     GATE_KEY_PREFIX_KIMI_K3,
     create_fabric_router_config,
     create_gate_weights,
-    get_max_payload_size,
     get_sp_mesh_composer,
     load_gate_weights_from_hf,
 )
@@ -43,6 +43,7 @@ from models.demos.deepseek_v3_d_p.tt.moe.validation_helpers import (
     validate_composed,
 )
 from models.demos.deepseek_v3_d_p.tt.moe.visualization_helpers import log_validation_results
+from models.demos.deepseek_v3_d_p.tt.tt_ccl import per_axis_topology
 from models.demos.deepseek_v3_d_p.utils.test_utils import adjust_shapes_for_testing, get_input_mem_config
 from models.demos.deepseek_v3_d_p.utils.transformer_helpers import GOLDEN_LONGBOOK_TRACE, load_trace_gate_input
 
@@ -190,71 +191,31 @@ def _try_load_real_gate_input(max_seq_len: int, dim: int) -> torch.Tensor | None
 MESH_CONFIGS = [
     pytest.param(
         (2, 2),
-        {
-            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
-            "fabric_router_config": create_fabric_router_config(max_payload_size=get_max_payload_size()),
-        },
+        fabric2d_device_params(),
         2,
-        ttnn.Topology.Linear,
-        marks=pytest.mark.requires_mesh_topology(mesh_shape=(2, 2), topology="mesh-2x2"),
-        id="mesh-2x2",
-    ),
-    pytest.param(
-        (2, 2),
-        {
-            "fabric_config": ttnn.FabricConfig.FABRIC_2D,
-            "fabric_router_config": create_fabric_router_config(max_payload_size=get_max_payload_size()),
-            "reliability_mode": ttnn.FabricReliabilityMode.RELAXED_INIT,
-        },
-        2,
-        ttnn.Topology.Linear,
         marks=pytest.mark.requires_mesh_topology(mesh_shape=(2, 2), topology="mesh-2x2"),
         id="fabric2d-mesh-2x2",
     ),
     pytest.param(
         (4, 2),
-        {
-            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
-            "fabric_router_config": create_fabric_router_config(max_payload_size=get_max_payload_size()),
-        },
+        fabric2d_device_params(),
         2,
-        ttnn.Topology.Linear,
-        marks=pytest.mark.requires_mesh_topology(mesh_shape=(4, 2), topology="mesh-4x2"),
-        id="mesh-4x2",
-    ),
-    pytest.param(
-        (4, 2),
-        {
-            "fabric_config": ttnn.FabricConfig.FABRIC_2D,
-            "fabric_router_config": create_fabric_router_config(max_payload_size=get_max_payload_size()),
-            "reliability_mode": ttnn.FabricReliabilityMode.RELAXED_INIT,
-        },
-        2,
-        ttnn.Topology.Linear,
         marks=pytest.mark.requires_mesh_topology(mesh_shape=(4, 2), topology="mesh-4x2"),
         id="fabric2d-mesh-4x2",
     ),
     pytest.param(
         (2, 4),
-        {
-            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
-            "fabric_router_config": create_fabric_router_config(max_payload_size=get_max_payload_size()),
-        },
+        fabric2d_device_params(),
         2,
-        ttnn.Topology.Linear,
         marks=pytest.mark.requires_mesh_topology(mesh_shape=(2, 4), topology="mesh-2x4"),
-        id="mesh-2x4",
+        id="fabric2d-mesh-2x4",
     ),
     pytest.param(
         (8, 4),
-        {
-            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
-            "fabric_router_config": create_fabric_router_config(max_payload_size=get_max_payload_size()),
-        },
+        torus_xy_device_params(),
         2,
-        ttnn.Topology.Linear,
         marks=pytest.mark.requires_mesh_topology(mesh_shape=(8, 4), topology="mesh-8x4"),
-        id="mesh-8x4",
+        id="torus-xy-8x4",
     ),
 ]
 
@@ -392,15 +353,15 @@ def _validate_gate(
 
 @pytest.mark.parametrize("gate_model, gate_fallback_mode", REGULAR_GATE_CASES)
 @pytest.mark.parametrize(
-    "mesh_device, device_params, num_links, topology",
+    "mesh_device, device_params, num_links",
     MESH_CONFIGS,
     indirect=["mesh_device", "device_params"],
 )
 def test_forward_pass(
     gate_model,
     mesh_device,
+    device_params,
     num_links,
-    topology,
     gate_fallback_mode,
 ):
     """Gate PCC across model variants and compute modes. The gate picks grouped vs plain top-k from
@@ -411,6 +372,7 @@ def test_forward_pass(
 
     config = _gate_config(gate_model)
     config.ccl_config["NUM_LINKS"] = num_links
+    config.ccl_config["TOPOLOGY"] = per_axis_topology(device_params["fabric_config"])[config.ccl_config["TP_AXIS"]]
     adjust_shapes_for_testing(config, mesh_device)
 
     # DeepSeek-V3's weights can't be reshaped to other expert counts or activations, so that path
@@ -554,7 +516,7 @@ HASH_GATE_MODES = [
 @pytest.mark.parametrize("gate_model", ["dsv4_pro", "dsv4_flash"])
 @pytest.mark.parametrize("gate_compute_mode", HASH_GATE_MODES)
 @pytest.mark.parametrize(
-    "mesh_device, device_params, num_links, topology",
+    "mesh_device, device_params, num_links",
     MESH_CONFIGS,
     indirect=["mesh_device", "device_params"],
 )
@@ -562,8 +524,8 @@ def test_hash_gate_forward_pass(
     gate_model,
     gate_compute_mode,
     mesh_device,
+    device_params,
     num_links,
-    topology,
 ):
     """DeepSeek-V4 hash-routing gate PCC (host-first HASH_HOST and on-device HASH_DEVICE).
 
@@ -578,6 +540,7 @@ def test_hash_gate_forward_pass(
 
     config = _gate_config(gate_model)
     config.ccl_config["NUM_LINKS"] = num_links
+    config.ccl_config["TOPOLOGY"] = per_axis_topology(device_params["fabric_config"])[config.ccl_config["TP_AXIS"]]
     adjust_shapes_for_testing(config, mesh_device)
 
     gate_w = create_gate_weights(config.n_routed_experts, config.dim)
