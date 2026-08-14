@@ -593,8 +593,12 @@ void DispatchKernel::CreateKernel() {
     defines["OFFSETOF_TO_DEV_ID"] = std::to_string(static_config_.offsetof_to_dev_id.value_or(0));
     defines["OFFSETOF_ROUTER_DIRECTION"] = std::to_string(static_config_.offsetof_router_direction.value_or(0));
 
-    // Compile at Os on IERISC to fit in code region.
-    auto optimization_level = (GetCoreType() == CoreType::WORKER) ? KernelBuildOptLevel::O2 : KernelBuildOptLevel::Os;
+    // Compile at Os on IERISC to fit in code region. CoreType::DISPATCH (Quasar dispatch-engine) has no such
+    // code-size constraint, so it gets O2 like WORKER.
+    auto core_type = GetCoreType();
+    auto optimization_level = (core_type == CoreType::WORKER || core_type == CoreType::DISPATCH)
+                                  ? KernelBuildOptLevel::O2
+                                  : KernelBuildOptLevel::Os;
     configure_kernel_variant(dispatch_kernel_file_names[DISPATCH], compile_args, defines, optimization_level);
 }
 
