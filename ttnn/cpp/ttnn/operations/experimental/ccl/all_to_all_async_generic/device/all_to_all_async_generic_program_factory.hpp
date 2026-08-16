@@ -37,7 +37,9 @@ struct AllToAllAsyncGenericProgram {
         const AllToAllAsyncGenericInputs& tensor_args,
         Tensor& tensor_return_value,
         const tt::tt_metal::GlobalSemaphore& init_barrier_semaphore,
-        const tt::tt_metal::GlobalSemaphore& final_barrier_semaphore);
+        const tt::tt_metal::GlobalSemaphore& final_barrier_semaphore,
+        const std::vector<CoreCoord>& global_worker_virtual_core_map,
+        CoreCoord logical_worker_grid_size);
 
     static void override_runtime_arguments(
         cached_mesh_workload_t& cached_workload,

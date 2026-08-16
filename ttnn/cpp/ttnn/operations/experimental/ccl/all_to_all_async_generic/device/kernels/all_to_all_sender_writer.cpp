@@ -11,6 +11,7 @@
 #include "cpp/ttnn/operations/ccl/common/types/fabric_directions.hpp"
 #include "cpp/ttnn/operations/ccl/kernel_common/worker_routing_utils.hpp"
 #include "cpp/ttnn/operations/data_movement/common/kernels/common.hpp"
+#include "tt_metal/fabric/hw/inc/edm_fabric/routing_plane_connection_manager.hpp"
 #include "tt_metal/fabric/hw/inc/tt_fabric_mux_v2_sender.hpp"
 #include "ckernel.h"
 #include <cstdint>
@@ -39,16 +40,26 @@ constexpr uint16_t source_mesh_id = get_compile_time_arg_val(14);
 constexpr bool is_fabric_2d = get_compile_time_arg_val(15);
 constexpr uint32_t fabric_direction_mask = get_compile_time_arg_val(16);
 constexpr uint32_t max_pages_per_packet = get_compile_time_arg_val(17);
-constexpr auto output_tensor_args = TensorAccessorArgs<18>();
+constexpr uint32_t custom_fabric2d_route_words = get_compile_time_arg_val(18);
+constexpr auto output_tensor_args = TensorAccessorArgs<19>();
 constexpr uint32_t mux_ct_base = output_tensor_args.next_compile_time_args_offset();
 constexpr bool use_worker_mux = get_compile_time_arg_val(mux_ct_base) != 0;
 constexpr uint32_t mux_num_clients = get_compile_time_arg_val(mux_ct_base + 1);
 constexpr uint32_t compile_safe_mux_num_clients = mux_num_clients == 0 ? 1 : mux_num_clients;
 constexpr bool has_fabric_connections = fabric_direction_mask != 0;
+constexpr bool has_custom_fabric2d_routes = custom_fabric2d_route_words != 0;
+static_assert(!has_custom_fabric2d_routes || is_fabric_2d, "Custom routes require Fabric2D");
+// Base record: offset, block range/stride, completion, mesh and chip. Fabric2D adds the destination's harvested drain
+// coordinate. Only programs that actually split an antipode add route metadata and the words used by that route.
+constexpr uint32_t target_drain_args = is_fabric_2d ? 2 : 0;
+constexpr uint32_t target_custom_route_args = has_custom_fabric2d_routes ? 2 + custom_fabric2d_route_words : 0;
+constexpr uint32_t target_runtime_args = 7 + target_drain_args + target_custom_route_args;
+constexpr uint32_t target_drain_args_idx = 7;
+constexpr uint32_t target_custom_route_args_idx = 7 + target_drain_args;
+constexpr uint32_t default_initial_direction = static_cast<uint32_t>(tt::tt_fabric::eth_chan_directions::COUNT);
 constexpr auto fabric_directions =
     ttnn::operations::ccl::common::fabric_direction_mask_to_directions(fabric_direction_mask);
-constexpr auto num_fabric_directions = ttnn::operations::ccl::common::num_fabric_directions;
-using Fabric2DConnections = std::array<tt::tt_fabric::WorkerToFabricEdmSender, num_fabric_directions>;
+using Fabric2DConnections = tt::tt_fabric::RoutingPlaneConnectionManager;
 using FabricMuxSender = tt::tt_fabric::FabricMuxV2Sender<>;
 struct FabricMuxConnection {
     FabricMuxSender sender;
@@ -56,11 +67,74 @@ struct FabricMuxConnection {
 using DirectFabricConnections = std::conditional_t<is_fabric_2d, Fabric2DConnections, FabricConnectionManager>;
 using FabricConnections = std::conditional_t<use_worker_mux, FabricMuxConnection, DirectFabricConnections>;
 
+FORCE_INLINE uint32_t get_custom_route_num_commands(size_t target_arg_idx) {
+    if constexpr (has_custom_fabric2d_routes) {
+        return get_arg_val<uint32_t>(target_arg_idx + target_custom_route_args_idx);
+    }
+    return 0;
+}
+
+FORCE_INLINE uint32_t get_custom_route_initial_direction(size_t target_arg_idx) {
+    if constexpr (has_custom_fabric2d_routes) {
+        return get_arg_val<uint32_t>(target_arg_idx + target_custom_route_args_idx + 1);
+    }
+    return default_initial_direction;
+}
+
+FORCE_INLINE size_t get_custom_route_packed_args_idx(size_t target_arg_idx) {
+    return target_arg_idx + target_custom_route_args_idx + 2;
+}
+
+[[noreturn]] FORCE_INLINE void fail_stop_invalid_fabric_route() {
+    // ASSERT is intentionally compiled out in production kernels. An invalid connection/route must stop this worker
+    // instead of silently injecting a packet on an arbitrary egress and corrupting the collective's completion count.
+    asm volatile("ebreak");
+    while (true) {
+    }
+}
+
+template <typename PacketHeader>
+FORCE_INLINE void set_target_unicast_route(
+    volatile PacketHeader* packet_header,
+    const ccl_routing_utils::line_unicast_route_info_t& route_info,
+    uint32_t custom_route_num_commands,
+    size_t custom_route_args_idx) {
+    if constexpr (std::is_same_v<PacketHeader, tt::tt_fabric::HybridMeshPacketHeader>) {
+        if (custom_route_num_commands != 0) {
+            if (custom_route_num_commands > tt::tt_fabric::FabricHeaderConfig::MESH_ROUTE_BUFFER_SIZE) {
+                fail_stop_invalid_fabric_route();
+            }
+            packet_header->dst_start_node_id =
+                (static_cast<uint32_t>(route_info.dst_mesh_id) << 16) | route_info.dst_chip_id;
+            packet_header->mcast_params_64 = 0;
+            packet_header->is_mcast_active = 0;
+            packet_header->routing_fields.value = 0;
+            for (uint32_t command = 0; command < tt::tt_fabric::FabricHeaderConfig::MESH_ROUTE_BUFFER_SIZE; ++command) {
+                constexpr uint32_t commands_per_word = 8;
+                uint8_t route_command = 0;
+                if (command < custom_route_num_commands) {
+                    const uint32_t packed_word =
+                        get_arg_val<uint32_t>(custom_route_args_idx + command / commands_per_word);
+                    route_command = static_cast<uint8_t>((packed_word >> ((command % commands_per_word) * 4)) & 0xf);
+                }
+                packet_header->route_buffer[command] = route_command;
+            }
+            return;
+        }
+    } else {
+        if (custom_route_num_commands != 0) {
+            fail_stop_invalid_fabric_route();
+        }
+    }
+    ccl_routing_utils::fabric_set_line_unicast_route(packet_header, route_info);
+}
+
 inline FabricMuxSender& select_connection(
     FabricMuxConnection& fabric_connection,
     [[maybe_unused]] int device_offset,
     [[maybe_unused]] uint16_t dest_mesh_id,
-    [[maybe_unused]] uint16_t dest_chip_id) {
+    [[maybe_unused]] uint16_t dest_chip_id,
+    [[maybe_unused]] uint32_t initial_direction) {
     return fabric_connection.sender;
 }
 
@@ -68,34 +142,42 @@ inline tt::tt_fabric::WorkerToFabricEdmSender& select_connection(
     Fabric2DConnections& fabric_connections,
     [[maybe_unused]] int device_offset,
     uint16_t dest_mesh_id,
-    uint16_t dest_chip_id) {
-    return fabric_connections[get_next_hop_router_direction(dest_mesh_id, dest_chip_id)];
+    uint16_t dest_chip_id,
+    uint32_t initial_direction) {
+    const uint32_t direction = initial_direction == default_initial_direction
+                                   ? static_cast<uint32_t>(get_next_hop_router_direction(dest_mesh_id, dest_chip_id))
+                                   : initial_direction;
+    for (uint32_t slot = 0; slot < fabric_connections.active_count(); ++slot) {
+        if (fabric_connections.get_tag(slot) == direction) {
+            return fabric_connections.get(slot).sender;
+        }
+    }
+    fail_stop_invalid_fabric_route();
 }
 
 inline tt::tt_fabric::WorkerToFabricEdmSender& select_connection(
     FabricConnectionManager& fabric_connections,
     int device_offset,
     [[maybe_unused]] uint16_t dest_mesh_id,
-    [[maybe_unused]] uint16_t dest_chip_id) {
+    [[maybe_unused]] uint16_t dest_chip_id,
+    [[maybe_unused]] uint32_t initial_direction) {
     return (device_offset > 0) ? fabric_connections.get_forward_connection()
                                : fabric_connections.get_backward_connection();
 }
 
-inline void finish_open_connections(Fabric2DConnections& fabric_connections) {
-    ttnn::operations::ccl::common::open_direction_connections_barrier(fabric_directions, fabric_connections);
+inline void finish_all_to_all_connections(Fabric2DConnections& fabric_connections) { fabric_connections.open_finish(); }
+
+inline void finish_all_to_all_connections(FabricConnectionManager& fabric_connections) {
+    fabric_connections.open_finish();
 }
 
-inline void finish_open_connections(FabricConnectionManager& fabric_connections) { fabric_connections.open_finish(); }
+inline void finish_all_to_all_connections(FabricMuxConnection& fabric_connection) { fabric_connection.sender.open(); }
 
-inline void finish_open_connections(FabricMuxConnection& fabric_connection) { fabric_connection.sender.open(); }
+inline void close_all_to_all_connections(Fabric2DConnections& fabric_connections) { fabric_connections.close(); }
 
-inline void close_connections(Fabric2DConnections& fabric_connections) {
-    ttnn::operations::ccl::common::close_direction_connections(fabric_directions, fabric_connections);
-}
+inline void close_all_to_all_connections(FabricConnectionManager& fabric_connections) { fabric_connections.close(); }
 
-inline void close_connections(FabricConnectionManager& fabric_connections) { fabric_connections.close(); }
-
-inline void close_connections(FabricMuxConnection& fabric_connection) { fabric_connection.sender.close(); }
+inline void close_all_to_all_connections(FabricMuxConnection& fabric_connection) { fabric_connection.sender.close(); }
 
 inline void send_mux_packet_blocking(
     FabricMuxConnection& fabric_connection, uint32_t packet_header_address, size_t packet_header_size) {
@@ -112,6 +194,7 @@ void send_initialization(
     uint32_t local_num_devices,
     size_t device_offsets_idx,
     uint64_t init_semaphore_noc_addr_in_pkt,
+    uint32_t global_init_semaphore_addr,
     volatile PacketHeader* pkt_hdr_sema_forward,
     volatile PacketHeader* pkt_hdr_sema_backward,
     uint32_t packet_header_buffer_addr_sema_forward,
@@ -127,14 +210,13 @@ void send_initialization(
     if (link_id != 0) {
         return;
     }
-    if constexpr (Topology == tt::tt_fabric::Topology::Ring) {
-        // Ring destinations are split across direction-specific mux workers. Have link 0 send one unicast
-        // initialization increment for each unique destination owned by this worker. Ring bank schedules are striped
-        // across mux clients; the client owning destination bank 0 is the single initialization owner. This is
-        // independent of 1D hop-count versus Fabric2D mesh/chip routing and guarantees exactly one increment per
-        // source at every remote destination.
+    if constexpr (Topology == tt::tt_fabric::Topology::Ring || is_fabric_2d) {
+        // Ring destinations and folded Fabric2D Linear axes are split across direction-specific mux workers. Have link
+        // 0 send one unicast initialization increment for each unique destination owned by this worker. Bank schedules
+        // are striped across mux clients; the client owning destination bank 0 is the single initialization owner.
+        // Per-target unicast avoids assuming that a logical Linear axis follows one physical mesh row or column.
         for (uint32_t did = 0; did < local_num_devices; ++did) {
-            const size_t target_arg_idx = device_offsets_idx + did * 7;
+            const size_t target_arg_idx = device_offsets_idx + did * target_runtime_args;
             const int32_t device_offset = get_arg_val<int32_t>(target_arg_idx);
             const uint32_t block_start = get_arg_val<uint32_t>(target_arg_idx + 1);
             if (device_offset == 0 || block_start != 0) {
@@ -144,16 +226,26 @@ void send_initialization(
             const ccl_routing_utils::line_unicast_route_info_t route_info = {
                 .dst_mesh_id = static_cast<uint16_t>(get_arg_val<uint32_t>(target_arg_idx + 5)),
                 .dst_chip_id = static_cast<uint16_t>(get_arg_val<uint32_t>(target_arg_idx + 6))};
+            const uint64_t target_init_semaphore_noc_addr =
+                is_fabric_2d ? safe_get_noc_addr(
+                                   get_arg_val<uint32_t>(target_arg_idx + target_drain_args_idx),
+                                   get_arg_val<uint32_t>(target_arg_idx + target_drain_args_idx + 1),
+                                   global_init_semaphore_addr)
+                             : init_semaphore_noc_addr_in_pkt;
             auto* packet_header = device_offset > 0 ? pkt_hdr_sema_forward : pkt_hdr_sema_backward;
             const uint32_t packet_header_address =
                 device_offset > 0 ? packet_header_buffer_addr_sema_forward : packet_header_buffer_addr_sema_backward;
-            ccl_routing_utils::fabric_set_line_unicast_route(packet_header, route_info);
+            set_target_unicast_route(
+                packet_header,
+                route_info,
+                get_custom_route_num_commands(target_arg_idx),
+                get_custom_route_packed_args_idx(target_arg_idx));
             packet_header->to_noc_unicast_atomic_inc(
-                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{init_semaphore_noc_addr_in_pkt, 1});
+                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{target_init_semaphore_noc_addr, 1});
             send_mux_packet_blocking(fabric_connection, packet_header_address, sizeof(PacketHeader));
         }
     } else {
-        // Linear uses one multicast per direction, so only one Mux V2 client owns initialization.
+        // Fabric1D Linear uses one multicast per direction, so only one Mux V2 client owns initialization.
         if (core_id % compile_safe_mux_num_clients != 0) {
             return;
         }
@@ -210,9 +302,10 @@ void send_initialization(
     Fabric2DConnections& fabric_connections,
     [[maybe_unused]] uint32_t core_id,
     uint32_t link_id,
-    [[maybe_unused]] uint32_t local_num_devices,
-    [[maybe_unused]] size_t device_offsets_idx,
-    uint64_t init_semaphore_noc_addr_in_pkt,
+    uint32_t local_num_devices,
+    size_t device_offsets_idx,
+    [[maybe_unused]] uint64_t init_semaphore_noc_addr_in_pkt,
+    uint32_t global_init_semaphore_addr,
     volatile PacketHeader* pkt_hdr_sema_forward,
     volatile PacketHeader* pkt_hdr_sema_backward,
     uint32_t packet_header_buffer_addr_sema_forward,
@@ -228,36 +321,43 @@ void send_initialization(
     if (link_id != 0) {
         return;
     }
-    constexpr uint32_t positive_range = num_devices - current_device_id - 1;
-    constexpr uint32_t negative_range = current_device_id;
-    constexpr uint32_t positive_direction =
-        replicate_axis == ReplicateGroup::COLS ? eth_chan_directions::SOUTH : eth_chan_directions::EAST;
-    constexpr uint32_t negative_direction =
-        replicate_axis == ReplicateGroup::COLS ? eth_chan_directions::NORTH : eth_chan_directions::WEST;
 
-    if constexpr (positive_range > 0 && fabric_directions[positive_direction]) {
-        constexpr uint16_t east_range = replicate_axis == ReplicateGroup::ROWS ? positive_range : 0;
-        constexpr uint16_t south_range = replicate_axis == ReplicateGroup::COLS ? positive_range : 0;
-        tt::tt_fabric::fabric_set_mcast_route(
-            pkt_hdr_sema_forward, source_chip_id, source_mesh_id, east_range, 0, 0, south_range);
-        pkt_hdr_sema_forward->to_noc_unicast_atomic_inc(
-            tt::tt_fabric::NocUnicastAtomicIncCommandHeader{init_semaphore_noc_addr_in_pkt, 1});
-        auto& connection = fabric_connections[positive_direction];
+    // A logical ring can turn through several physical directions. Send one initialization increment to every unique
+    // destination owned by this stream, using the connection selected from the destination's actual first hop. Bank
+    // schedules are striped across streams, so the stream owning destination bank 0 is the single initialization owner.
+    for (uint32_t did = 0; did < local_num_devices; ++did) {
+        const size_t target_arg_idx = device_offsets_idx + did * target_runtime_args;
+        const int32_t device_offset = get_arg_val<int32_t>(target_arg_idx);
+        const uint32_t block_start = get_arg_val<uint32_t>(target_arg_idx + 1);
+        if (device_offset == 0 || block_start != 0) {
+            continue;
+        }
+
+        const ccl_routing_utils::line_unicast_route_info_t route_info = {
+            .dst_mesh_id = static_cast<uint16_t>(get_arg_val<uint32_t>(target_arg_idx + 5)),
+            .dst_chip_id = static_cast<uint16_t>(get_arg_val<uint32_t>(target_arg_idx + 6))};
+        const uint64_t target_init_semaphore_noc_addr = safe_get_noc_addr(
+            get_arg_val<uint32_t>(target_arg_idx + target_drain_args_idx),
+            get_arg_val<uint32_t>(target_arg_idx + target_drain_args_idx + 1),
+            global_init_semaphore_addr);
+        auto* packet_header = device_offset > 0 ? pkt_hdr_sema_forward : pkt_hdr_sema_backward;
+        const uint32_t packet_header_address =
+            device_offset > 0 ? packet_header_buffer_addr_sema_forward : packet_header_buffer_addr_sema_backward;
+        set_target_unicast_route(
+            packet_header,
+            route_info,
+            get_custom_route_num_commands(target_arg_idx),
+            get_custom_route_packed_args_idx(target_arg_idx));
+        packet_header->to_noc_unicast_atomic_inc(
+            tt::tt_fabric::NocUnicastAtomicIncCommandHeader{target_init_semaphore_noc_addr, 1});
+        auto& connection = select_connection(
+            fabric_connections,
+            device_offset,
+            route_info.dst_mesh_id,
+            route_info.dst_chip_id,
+            get_custom_route_initial_direction(target_arg_idx));
         connection.wait_for_empty_write_slot();
-        connection.send_payload_flush_blocking_from_address(
-            packet_header_buffer_addr_sema_forward, sizeof(PacketHeader));
-    }
-    if constexpr (negative_range > 0 && fabric_directions[negative_direction]) {
-        constexpr uint16_t west_range = replicate_axis == ReplicateGroup::ROWS ? negative_range : 0;
-        constexpr uint16_t north_range = replicate_axis == ReplicateGroup::COLS ? negative_range : 0;
-        tt::tt_fabric::fabric_set_mcast_route(
-            pkt_hdr_sema_backward, source_chip_id, source_mesh_id, 0, west_range, north_range, 0);
-        pkt_hdr_sema_backward->to_noc_unicast_atomic_inc(
-            tt::tt_fabric::NocUnicastAtomicIncCommandHeader{init_semaphore_noc_addr_in_pkt, 1});
-        auto& connection = fabric_connections[negative_direction];
-        connection.wait_for_empty_write_slot();
-        connection.send_payload_flush_blocking_from_address(
-            packet_header_buffer_addr_sema_backward, sizeof(PacketHeader));
+        connection.send_payload_flush_blocking_from_address(packet_header_address, sizeof(PacketHeader));
     }
 }
 
@@ -269,6 +369,7 @@ void send_initialization(
     [[maybe_unused]] uint32_t local_num_devices,
     [[maybe_unused]] size_t device_offsets_idx,
     uint64_t init_semaphore_noc_addr_in_pkt,
+    [[maybe_unused]] uint32_t global_init_semaphore_addr,
     volatile PacketHeader* pkt_hdr_sema_forward,
     volatile PacketHeader* pkt_hdr_sema_backward,
     uint32_t packet_header_buffer_addr_sema_forward,
@@ -333,6 +434,7 @@ void write_data(
     int device_offset,
     uint16_t dest_mesh_id,
     uint16_t dest_chip_id,
+    uint32_t initial_direction,
     bool last) {
     bool local = device_offset == 0;
     if (local) {
@@ -355,7 +457,8 @@ void write_data(
                     pkt_hdr->to_noc_unicast_scatter_write(
                         NocUnicastScatterCommandHeader(dest_addrs, payload_sizes, parts_count - 1), scatter_payload);
                     perform_payload_send(
-                        select_connection(fabric_connections, device_offset, dest_mesh_id, dest_chip_id),
+                        select_connection(
+                            fabric_connections, device_offset, dest_mesh_id, dest_chip_id, initial_direction),
                         l1_read_addr,
                         scatter_payload,
                         pkt_hdr);
@@ -363,7 +466,8 @@ void write_data(
                 } else {
                     pkt_hdr->to_noc_unicast_write(NocUnicastCommandHeader({dest_addrs[0]}), payload_sizes[0]);
                     perform_payload_send(
-                        select_connection(fabric_connections, device_offset, dest_mesh_id, dest_chip_id),
+                        select_connection(
+                            fabric_connections, device_offset, dest_mesh_id, dest_chip_id, initial_direction),
                         l1_read_addr,
                         payload_sizes[0],
                         pkt_hdr);
@@ -377,7 +481,7 @@ void write_data(
                     {dest_addrs[parts_count - 1], output_semaphore_noc_addr_in_pkt, 1, false}),
                 payload_sizes[parts_count - 1]);
             perform_payload_send(
-                select_connection(fabric_connections, device_offset, dest_mesh_id, dest_chip_id),
+                select_connection(fabric_connections, device_offset, dest_mesh_id, dest_chip_id, initial_direction),
                 l1_read_addr,
                 payload_sizes[parts_count - 1],
                 pkt_hdr);
@@ -393,7 +497,7 @@ void write_data(
                     NocUnicastScatterCommandHeader(dest_addrs, payload_sizes, parts_count), scatter_payload);
             }
             perform_payload_send(
-                select_connection(fabric_connections, device_offset, dest_mesh_id, dest_chip_id),
+                select_connection(fabric_connections, device_offset, dest_mesh_id, dest_chip_id, initial_direction),
                 l1_read_addr,
                 scatter_payload,
                 pkt_hdr);
@@ -425,19 +529,16 @@ void kernel_main() {
     uint32_t local_num_devices = get_arg_val<uint32_t>(arg_idx++);
     auto output_addrgen = TensorAccessor(output_tensor_args, output_address);
     size_t device_offsets_idx = arg_idx;
-    arg_idx += local_num_devices * 7;
+    arg_idx += local_num_devices * target_runtime_args;
 
     auto fabric_connections = [&]() {
         if constexpr (use_worker_mux) {
             auto sender = FabricMuxSender::build_from_args(arg_idx);
             return FabricMuxConnection{.sender = sender};
         } else if constexpr (is_fabric_2d) {
-            Fabric2DConnections connections;
-            if constexpr (has_fabric_connections) {
-                ttnn::operations::ccl::common::open_direction_connections_async(
-                    fabric_directions, connections, arg_idx);
-            }
-            return connections;
+            const uint32_t num_connections = get_arg_val<uint32_t>(arg_idx++);
+            return Fabric2DConnections::build_from_args<Fabric2DConnections::BUILD_AND_OPEN_CONNECTION_START_ONLY>(
+                arg_idx, num_connections);
         } else {
             return FabricConnectionManager::build_from_args<
                 FabricConnectionManager::BUILD_AND_OPEN_CONNECTION_START_ONLY>(arg_idx);
@@ -481,8 +582,8 @@ void kernel_main() {
         reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_buffer_addr_sema_backward);
 
     {
-        if constexpr (has_fabric_connections) {
-            finish_open_connections(fabric_connections);
+        if constexpr ((is_fabric_2d && !use_worker_mux) || has_fabric_connections) {
+            finish_all_to_all_connections(fabric_connections);
         }
     }
 
@@ -497,6 +598,7 @@ void kernel_main() {
             local_num_devices,
             device_offsets_idx,
             init_semaphore_noc_addr_in_pkt,
+            global_init_semaphore_addr,
             pkt_hdr_sema_forward,
             pkt_hdr_sema_backward,
             packet_header_buffer_addr_sema_forward,
@@ -533,6 +635,24 @@ void kernel_main() {
             const ccl_routing_utils::line_unicast_route_info_t route_info = {
                 .dst_mesh_id = static_cast<uint16_t>(get_arg_val<uint32_t>(device_offsets_idx++)),
                 .dst_chip_id = static_cast<uint16_t>(get_arg_val<uint32_t>(device_offsets_idx++))};
+            uint32_t target_drain_sync_core_x = 0;
+            uint32_t target_drain_sync_core_y = 0;
+            if constexpr (is_fabric_2d) {
+                target_drain_sync_core_x = get_arg_val<uint32_t>(device_offsets_idx++);
+                target_drain_sync_core_y = get_arg_val<uint32_t>(device_offsets_idx++);
+            }
+            uint32_t custom_route_num_commands = 0;
+            uint32_t custom_route_initial_direction = default_initial_direction;
+            if constexpr (has_custom_fabric2d_routes) {
+                custom_route_num_commands = get_arg_val<uint32_t>(device_offsets_idx++);
+                custom_route_initial_direction = get_arg_val<uint32_t>(device_offsets_idx++);
+            }
+            const size_t custom_route_args_idx = device_offsets_idx;
+            device_offsets_idx += custom_fabric2d_route_words;
+            const uint64_t target_output_semaphore_noc_addr =
+                is_fabric_2d
+                    ? safe_get_noc_addr(target_drain_sync_core_x, target_drain_sync_core_y, global_semaphore_addr)
+                    : output_semaphore_noc_addr_in_pkt;
             const uint32_t device_id = (current_device_id + device_offset + num_devices) % num_devices;
 
             volatile PACKET_HEADER_TYPE* pkt_hdr = nullptr;
@@ -542,7 +662,7 @@ void kernel_main() {
                 pkt_hdr = pkt_hdr_backward;
             }
             if (device_offset != 0) {
-                ccl_routing_utils::fabric_set_line_unicast_route(pkt_hdr, route_info);
+                set_target_unicast_route(pkt_hdr, route_info, custom_route_num_commands, custom_route_args_idx);
             }
 
             auto calculate_params = [&](int b) {
@@ -585,10 +705,11 @@ void kernel_main() {
                     pkt_hdr,
                     fabric_connections,
                     l1_read_addr,
-                    output_semaphore_noc_addr_in_pkt,
+                    target_output_semaphore_noc_addr,
                     device_offset,
                     route_info.dst_mesh_id,
                     route_info.dst_chip_id,
+                    custom_route_initial_direction,
                     last);
                 l1_read_addr += current_package_payload;
                 current_package_payload = 0;
@@ -631,8 +752,8 @@ void kernel_main() {
 
     noc_obj.async_write_barrier();
     {
-        if constexpr (has_fabric_connections) {
-            close_connections(fabric_connections);
+        if constexpr ((is_fabric_2d && !use_worker_mux) || has_fabric_connections) {
+            close_all_to_all_connections(fabric_connections);
         }
     }
     if (core_id == 0 && link_id == 0) {

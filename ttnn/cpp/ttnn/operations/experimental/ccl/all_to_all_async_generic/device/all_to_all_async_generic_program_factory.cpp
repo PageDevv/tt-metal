@@ -11,6 +11,8 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
+#include <tt-metalium/experimental/fabric/pipeline_builder.hpp>
+#include <tt-metalium/distributed_context.hpp>
 #include <algorithm>
 #include <set>
 #include <unordered_map>
@@ -19,6 +21,128 @@
 namespace ttnn::experimental::prim {
 
 namespace {
+constexpr uint32_t max_fabric2d_sender_connections = 4;
+
+uint32_t get_active_fabric2d_route_capacity() {
+    // Fabric2D uses max-capacity packet-header tiers: the fixed fields occupy 61 bytes and every remaining byte
+    // encodes one route command. Derive the capacity from the public active-header-size query instead of depending on
+    // FabricContext or duplicating its tier table in this op.
+    // TODO: Replace this layout-derived calculation once Fabric exposes the active Fabric2D route capacity publicly.
+    constexpr uint32_t fixed_header_bytes = 61;
+    const auto header_bytes = tt::tt_fabric::get_tt_fabric_packet_header_size_bytes();
+    TT_FATAL(header_bytes > fixed_header_bytes, "Invalid Fabric2D packet header size {}", header_bytes);
+    return header_bytes - fixed_header_bytes;
+}
+
+std::vector<CoreCoord> exchange_worker_virtual_core_map(MeshDevice* mesh_device, CoreCoord logical_grid_size) {
+    struct MappingRecord {
+        uint32_t valid = 0;
+        uint32_t x = 0;
+        uint32_t y = 0;
+    };
+
+    TT_FATAL(
+        logical_grid_size.x > 0 && logical_grid_size.y > 0,
+        "Cannot build an all-to-all worker-core map for logical grid {}",
+        logical_grid_size);
+
+    const auto mesh_shape = mesh_device->shape();
+    const size_t cores_per_node = static_cast<size_t>(logical_grid_size.x) * logical_grid_size.y;
+    std::vector<MappingRecord> local_records(mesh_shape.mesh_size() * cores_per_node);
+    for (const auto& coord : MeshCoordinateRange(mesh_shape)) {
+        if (!mesh_device->is_local(coord)) {
+            continue;
+        }
+        auto* local_device = mesh_device->get_device(coord);
+        const size_t node_index = coord.to_linear_index(mesh_shape);
+        for (uint32_t y = 0; y < logical_grid_size.y; ++y) {
+            for (uint32_t x = 0; x < logical_grid_size.x; ++x) {
+                const auto virtual_core = local_device->worker_core_from_logical_core({x, y});
+                auto& record = local_records[node_index * cores_per_node + y * logical_grid_size.x + x];
+                record = {
+                    .valid = 1, .x = static_cast<uint32_t>(virtual_core.x), .y = static_cast<uint32_t>(virtual_core.y)};
+            }
+        }
+    }
+
+    const auto& distributed_context = *tt::tt_metal::distributed::multihost::DistributedContext::get_current_world();
+    const size_t world_size = *distributed_context.size();
+    std::vector<MappingRecord> gathered_records(local_records.size() * world_size);
+    distributed_context.all_gather(
+        ttsl::as_writable_bytes(ttsl::Span<MappingRecord>{local_records}),
+        ttsl::as_writable_bytes(ttsl::Span<MappingRecord>{gathered_records}));
+
+    std::vector<CoreCoord> result(local_records.size());
+    std::vector<uint32_t> owner_counts(local_records.size(), 0);
+    for (size_t rank = 0; rank < world_size; ++rank) {
+        for (size_t index = 0; index < local_records.size(); ++index) {
+            const auto& record = gathered_records[rank * local_records.size() + index];
+            if (record.valid == 0) {
+                continue;
+            }
+            TT_FATAL(
+                owner_counts[index] == 0,
+                "All-to-all mesh node {} worker logical core ({}, {}) is owned by more than one distributed rank",
+                index / cores_per_node,
+                index % cores_per_node % logical_grid_size.x,
+                index % cores_per_node / logical_grid_size.x);
+            result[index] = {record.x, record.y};
+            owner_counts[index] = 1;
+        }
+    }
+    for (size_t index = 0; index < owner_counts.size(); ++index) {
+        TT_FATAL(
+            owner_counts[index] == 1,
+            "No distributed rank owns all-to-all mesh node {} worker logical core ({}, {})",
+            index / cores_per_node,
+            index % cores_per_node % logical_grid_size.x,
+            index % cores_per_node / logical_grid_size.x);
+    }
+    return result;
+}
+
+struct CustomFabric2DRoute {
+    uint32_t num_commands = 0;
+    tt::tt_fabric::eth_chan_directions initial_direction = tt::tt_fabric::eth_chan_directions::COUNT;
+    std::vector<uint32_t> packed_commands;
+};
+
+uint8_t fabric_direction_command(tt::tt_fabric::eth_chan_directions direction) {
+    using MeshRoutingFields = tt::tt_fabric::RoutingFieldsConstants::Mesh;
+    switch (direction) {
+        case tt::tt_fabric::eth_chan_directions::EAST: return MeshRoutingFields::FORWARD_EAST;
+        case tt::tt_fabric::eth_chan_directions::WEST: return MeshRoutingFields::FORWARD_WEST;
+        case tt::tt_fabric::eth_chan_directions::NORTH: return MeshRoutingFields::FORWARD_NORTH;
+        case tt::tt_fabric::eth_chan_directions::SOUTH: return MeshRoutingFields::FORWARD_SOUTH;
+        default:
+            TT_THROW("All-to-all custom route does not support fabric direction {}", static_cast<uint32_t>(direction));
+    }
+}
+
+uint8_t fabric_terminal_command(tt::tt_fabric::eth_chan_directions incoming_direction) {
+    switch (incoming_direction) {
+        case tt::tt_fabric::eth_chan_directions::EAST:
+            return fabric_direction_command(tt::tt_fabric::eth_chan_directions::WEST);
+        case tt::tt_fabric::eth_chan_directions::WEST:
+            return fabric_direction_command(tt::tt_fabric::eth_chan_directions::EAST);
+        case tt::tt_fabric::eth_chan_directions::NORTH:
+            return fabric_direction_command(tt::tt_fabric::eth_chan_directions::SOUTH);
+        case tt::tt_fabric::eth_chan_directions::SOUTH:
+            return fabric_direction_command(tt::tt_fabric::eth_chan_directions::NORTH);
+        default:
+            TT_THROW(
+                "All-to-all custom route does not support fabric direction {}",
+                static_cast<uint32_t>(incoming_direction));
+    }
+}
+
+void set_packed_route_command(CustomFabric2DRoute& route, uint32_t command_index, uint8_t command) {
+    constexpr uint32_t commands_per_word = 8;
+    TT_FATAL(command_index / commands_per_word < route.packed_commands.size(), "Custom route command is out of range");
+    route.packed_commands[command_index / commands_per_word] |= static_cast<uint32_t>(command)
+                                                                << ((command_index % commands_per_word) * 4);
+}
+
 ttnn::Shape get_tiled_shape(const ttnn::Tensor& input_tensor) {
     const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
     const auto& shape = input_tensor.padded_shape();
@@ -49,9 +173,9 @@ static_assert(
     banks_owned_by_link(8, 3, 0) == 3 && banks_owned_by_link(8, 3, 1) == 3 && banks_owned_by_link(8, 3, 2) == 2,
     "Uneven 8-bank/3-link ownership must distribute as 3, 3, 2");
 
-constexpr uint32_t direction_schedule_cores_per_link(uint32_t workers_per_direction) {
-    const uint32_t mux_cores = workers_per_direction > 1 ? 2 : 0;
-    return 2 * workers_per_direction + mux_cores + 1;  // two directions, optional muxes, and local copy
+constexpr uint32_t direction_schedule_cores_per_link(uint32_t workers_per_direction, uint32_t num_direction_groups) {
+    const uint32_t mux_cores = workers_per_direction > 1 ? num_direction_groups : 0;
+    return num_direction_groups * workers_per_direction + mux_cores + 1;  // remote groups, muxes, and local copy
 }
 
 }  // namespace
@@ -74,6 +198,13 @@ AllToAllAsyncGenericProgram::cached_mesh_workload_t AllToAllAsyncGenericProgram:
     auto final_barrier_semaphore = ttnn::global_semaphore::create_global_semaphore(mesh_device, available_cores, 0);
     tt::tt_metal::distributed::Synchronize(*mesh_device, std::nullopt, subdevices);
 
+    std::vector<CoreCoord> global_worker_virtual_core_map;
+    CoreCoord logical_worker_grid_size{};
+    if (tt::tt_fabric::is_2d_fabric_config(tt::tt_fabric::GetFabricConfig())) {
+        logical_worker_grid_size = mesh_device->compute_with_storage_grid_size();
+        global_worker_virtual_core_map = exchange_worker_virtual_core_map(mesh_device, logical_worker_grid_size);
+    }
+
     for (const auto& coord : tensor_coords.coords()) {
         auto cached_program = create_at(
             operation_attributes,
@@ -81,7 +212,9 @@ AllToAllAsyncGenericProgram::cached_mesh_workload_t AllToAllAsyncGenericProgram:
             tensor_args,
             tensor_return_value,
             init_barrier_semaphore,
-            final_barrier_semaphore);
+            final_barrier_semaphore,
+            global_worker_virtual_core_map,
+            logical_worker_grid_size);
         workload.add_program(ttnn::MeshCoordinateRange(coord), std::move(cached_program.program));
         shared_variables.emplace(ttnn::MeshCoordinateRange(coord), std::move(cached_program.shared_variables));
     }
@@ -96,7 +229,9 @@ AllToAllAsyncGenericProgram::create_at(
     const AllToAllAsyncGenericInputs& tensor_args,
     Tensor& tensor_return_value,
     const tt::tt_metal::GlobalSemaphore& init_barrier_semaphore,
-    const tt::tt_metal::GlobalSemaphore& final_barrier_semaphore) {
+    const tt::tt_metal::GlobalSemaphore& final_barrier_semaphore,
+    const std::vector<CoreCoord>& global_worker_virtual_core_map,
+    CoreCoord logical_worker_grid_size) {
     log_debug(tt::LogOp, "DEBUG: create_at is called");
 
     uint32_t device_index = ttnn::ccl::get_linearized_index_from_physical_coord(
@@ -106,6 +241,7 @@ AllToAllAsyncGenericProgram::create_at(
 
     const auto fabric_config = tt::tt_fabric::GetFabricConfig();
     const bool is_fabric_2d = tt::tt_fabric::is_2d_fabric_config(fabric_config);
+    const uint32_t fabric2d_route_capacity = is_fabric_2d ? get_active_fabric2d_route_capacity() : 0;
     // FABRIC_2D_TORUS_X/Y wraps only one mesh axis even though get_fabric_topology() reports Torus for both.
     // Resolve wrapping for the collective's axis so a Ring on the other axis cannot open a nonexistent hop.
     const auto axis_fabric_topology =
@@ -123,16 +259,18 @@ AllToAllAsyncGenericProgram::create_at(
         tensor_args.input_tensor, mesh_coordinate, 1, effective_topology, operation_attributes.cluster_axis);
     const std::optional<MeshCoordinate> backward_coord = ttnn::ccl::get_physical_neighbor_from_physical_coord(
         tensor_args.input_tensor, mesh_coordinate, -1, effective_topology, operation_attributes.cluster_axis);
-    const auto [fabric_neighbors, fabric_directions] = ttnn::operations::ccl::common::get_neighbors(
-        tensor_args.input_tensor.device()->get_view(),
-        mesh_coordinate,
-        connection_topology,
-        operation_attributes.cluster_axis);
+    const auto fabric_directions = ttnn::operations::ccl::common::get_neighbors(
+                                       tensor_args.input_tensor.device()->get_view(),
+                                       mesh_coordinate,
+                                       connection_topology,
+                                       operation_attributes.cluster_axis)
+                                       .second;
 
     TT_FATAL(device_index < operation_attributes.num_devices, "DEBUG: device_index: {}", device_index);
 
     tt::tt_metal::Program program{};
     MeshDevice* device = tensor_args.input_tensor.device();
+    auto* local_device = device->get_device(mesh_coordinate);
 
     std::vector<Tensor> input_tensors = {tensor_args.input_tensor};
     std::vector<Tensor> output_tensors = {tensor_return_value};
@@ -187,13 +325,203 @@ AllToAllAsyncGenericProgram::create_at(
     const uint32_t block_stride = use_bank_owned_schedule ? num_dram_banks : 1;
 
     // Direction ownership, worker parallelism, and bank ownership are independent choices. Large messages use up to
-    // three workers per physical direction; two or one are selected when a restricted subdevice cannot fit the
-    // preferred schedule. Multiple workers share one fabric connection through a mux, while a one-worker direction
-    // connects directly. Logical Ring over a non-wrapping mesh retains the legacy schedule because the sign of its
-    // logical shortest path does not identify the first physical hop.
+    // three workers per physical egress; two or one are selected when a restricted subdevice cannot fit the preferred
+    // schedule. Multiple workers sharing an egress use one mux, while a one-worker egress connects directly.
     constexpr uint32_t preferred_workers_per_direction = 3;
-    constexpr uint32_t mux_num_directions = 2;
-    const bool direction_routing_is_physical = !is_ring || fabric_has_wrap_links;
+    constexpr uint32_t logical_num_directions = 2;
+
+    // Build one collective-wide, compact ordering of the physical first-hop directions used by Fabric2D. Every chip
+    // uses the same stream-group indices, even when a direction is inactive on that chip, so transpose peers retain
+    // symmetric completion counts. A folded logical axis can use three or four physical egresses across the collective;
+    // grouping by the actual first hop lets those paths retain the parallel mux schedule instead of falling back to the
+    // serial routed schedule. Fabric1D keeps its original positive/negative logical groups.
+    constexpr uint32_t num_cardinal_fabric_directions = ttnn::operations::ccl::common::num_fabric_directions;
+    std::array<bool, num_cardinal_fabric_directions> collective_physical_directions{};
+    std::array<std::optional<tt::tt_fabric::FabricNodeId>, num_cardinal_fabric_directions>
+        current_direction_connection_nodes{};
+    if (is_fabric_2d) {
+        auto record_physical_direction = [&](uint32_t source_device,
+                                             const MeshCoordinate& source_coord,
+                                             int32_t offset) {
+            const auto source_node = device->get_fabric_node_id(source_coord);
+            const auto connection_coord = ttnn::ccl::get_physical_neighbor_from_physical_coord(
+                tensor_args.input_tensor, source_coord, offset, effective_topology, operation_attributes.cluster_axis);
+            TT_FATAL(connection_coord.has_value(), "No all-to-all target at device offset {}", offset);
+            const auto connection_node = device->get_fabric_node_id(*connection_coord);
+            const auto direction = tt::tt_fabric::get_eth_forwarding_direction(source_node, connection_node);
+            TT_FATAL(
+                direction.has_value(),
+                "No Fabric2D forwarding direction from all-to-all source {} to target {}",
+                source_node,
+                connection_node);
+            const uint32_t direction_index = static_cast<uint32_t>(*direction);
+            TT_FATAL(
+                direction_index < num_cardinal_fabric_directions,
+                "All-to-all does not support Fabric2D egress direction {}",
+                direction_index);
+            collective_physical_directions[direction_index] = true;
+            if (source_device == device_index && !current_direction_connection_nodes[direction_index].has_value()) {
+                current_direction_connection_nodes[direction_index] = connection_node;
+            }
+        };
+
+        for (uint32_t source_device = 0; source_device < operation_attributes.num_devices; ++source_device) {
+            MeshCoordinate source_coord = mesh_coordinate;
+            source_coord[cluster_axis] = source_device;
+            for (uint32_t target_device = 0; target_device < operation_attributes.num_devices; ++target_device) {
+                int32_t device_offset = static_cast<int32_t>(target_device) - static_cast<int32_t>(source_device);
+                if (is_ring) {
+                    const int32_t half_ring = static_cast<int32_t>(operation_attributes.num_devices / 2);
+                    if (device_offset < -half_ring) {
+                        device_offset += operation_attributes.num_devices;
+                    } else if (device_offset > half_ring) {
+                        device_offset -= operation_attributes.num_devices;
+                    }
+                }
+                if (device_offset == 0) {
+                    continue;
+                }
+                record_physical_direction(source_device, source_coord, device_offset);
+            }
+            // The destination-derived route table selects only one path to an even-ring antipode. Record both
+            // adjacent ring egresses so antipodal banks can use both equal-length arcs with an explicit matching
+            // route. TP2 has the same peer in both directions and therefore has no distinct second egress here.
+            if (is_ring && operation_attributes.num_devices > 2 && operation_attributes.num_devices % 2 == 0) {
+                record_physical_direction(source_device, source_coord, 1);
+                record_physical_direction(source_device, source_coord, -1);
+            }
+        }
+    }
+
+    std::vector<uint32_t> direction_group_to_physical_direction;
+    std::array<int32_t, num_cardinal_fabric_directions> physical_direction_to_group{};
+    physical_direction_to_group.fill(-1);
+    if (is_fabric_2d) {
+        for (uint32_t direction = 0; direction < num_cardinal_fabric_directions; ++direction) {
+            if (collective_physical_directions[direction]) {
+                physical_direction_to_group[direction] =
+                    static_cast<int32_t>(direction_group_to_physical_direction.size());
+                direction_group_to_physical_direction.push_back(direction);
+            }
+        }
+    } else {
+        direction_group_to_physical_direction = {0, 1};
+    }
+    const uint32_t num_direction_groups = static_cast<uint32_t>(direction_group_to_physical_direction.size());
+    TT_FATAL(num_direction_groups > 0, "All-to-all collective has no remote direction groups");
+    auto get_direct_ring_hop_directions =
+        [&](const MeshCoordinate& source_coord,
+            int32_t device_offset) -> std::optional<std::vector<tt::tt_fabric::eth_chan_directions>> {
+        const uint32_t num_hops = std::abs(device_offset);
+        std::vector<tt::tt_fabric::eth_chan_directions> hop_directions;
+        hop_directions.reserve(num_hops);
+        auto previous_coord = source_coord;
+        for (uint32_t hop = 1; hop <= num_hops; ++hop) {
+            const int32_t hop_offset = device_offset > 0 ? static_cast<int32_t>(hop) : -static_cast<int32_t>(hop);
+            const auto next_coord = ttnn::ccl::get_physical_neighbor_from_physical_coord(
+                tensor_args.input_tensor,
+                source_coord,
+                hop_offset,
+                effective_topology,
+                operation_attributes.cluster_axis);
+            TT_FATAL(next_coord.has_value(), "No ring coordinate at offset {}", hop_offset);
+            // Physical Ethernet channel maps are host-local. A custom route must therefore be proved entirely by the
+            // rank constructing this program; otherwise retain the canonical Fabric2D route.
+            if (!device->is_local(previous_coord) || !device->is_local(*next_coord)) {
+                return std::nullopt;
+            }
+            const auto previous_node = device->get_fabric_node_id(previous_coord);
+            const auto next_node = device->get_fabric_node_id(*next_coord);
+            const auto routing_direction = tt::tt_fabric::pipeline_get_forwarding_direction(previous_node, next_node);
+            if (!routing_direction.has_value()) {
+                return std::nullopt;
+            }
+            const auto direction = tt::tt_fabric::get_eth_forwarding_direction(previous_node, next_node);
+            if (!direction.has_value()) {
+                return std::nullopt;
+            }
+            const auto direct_neighbors = tt::tt_fabric::pipeline_get_chip_neighbors(previous_node, *routing_direction);
+            const auto mesh_it = direct_neighbors.find(*next_node.mesh_id);
+            if (mesh_it == direct_neighbors.end() ||
+                std::find(mesh_it->second.begin(), mesh_it->second.end(), next_node.chip_id) == mesh_it->second.end()) {
+                return std::nullopt;
+            }
+            hop_directions.push_back(*direction);
+            previous_coord = *next_coord;
+        }
+        return hop_directions;
+    };
+
+    auto custom_ring_route_is_representable = [&](const MeshCoordinate& source_coord, int32_t device_offset) {
+        const auto maybe_hop_directions = get_direct_ring_hop_directions(source_coord, device_offset);
+        if (!maybe_hop_directions.has_value() || maybe_hop_directions->empty() ||
+            maybe_hop_directions->size() > fabric2d_route_capacity) {
+            return false;
+        }
+        const auto& hop_directions = *maybe_hop_directions;
+        auto is_spine_direction = [](tt::tt_fabric::eth_chan_directions direction) {
+            return direction == tt::tt_fabric::eth_chan_directions::NORTH ||
+                   direction == tt::tt_fabric::eth_chan_directions::SOUTH;
+        };
+        auto is_branch_direction = [](tt::tt_fabric::eth_chan_directions direction) {
+            return direction == tt::tt_fabric::eth_chan_directions::EAST ||
+                   direction == tt::tt_fabric::eth_chan_directions::WEST;
+        };
+        // The mesh header has only one branch offset per E/W direction. A custom route with zeroed branch offsets is
+        // therefore safe only when a spine router never hands the packet to an E/W branch router. Canonical routing
+        // remains the correctness fallback for folded arcs that need that transition (including multi-turn snakes).
+        for (uint32_t hop = 1; hop < hop_directions.size(); ++hop) {
+            if (is_spine_direction(hop_directions[hop - 1]) && is_branch_direction(hop_directions[hop])) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    bool split_antipode_across_arcs = is_ring && !is_fabric_2d;
+    if (is_ring && is_fabric_2d && operation_attributes.num_devices > 2 && operation_attributes.num_devices % 2 == 0) {
+        const int32_t half_ring = static_cast<int32_t>(operation_attributes.num_devices / 2);
+        split_antipode_across_arcs = true;
+        for (uint32_t source_device = 0; source_device < operation_attributes.num_devices; ++source_device) {
+            MeshCoordinate source_coord = mesh_coordinate;
+            source_coord[cluster_axis] = source_device;
+            const auto positive_hops = get_direct_ring_hop_directions(source_coord, half_ring);
+            const auto negative_hops = get_direct_ring_hop_directions(source_coord, -half_ring);
+            const bool source_can_split = custom_ring_route_is_representable(source_coord, half_ring) &&
+                                          custom_ring_route_is_representable(source_coord, -half_ring) &&
+                                          positive_hops.has_value() && negative_hops.has_value() &&
+                                          positive_hops->front() != negative_hops->front();
+            if (!source_can_split) {
+                split_antipode_across_arcs = false;
+                break;
+            }
+        }
+    }
+
+    auto build_custom_ring_route = [&](int32_t device_offset) {
+        CustomFabric2DRoute route;
+        const auto maybe_hop_directions = get_direct_ring_hop_directions(mesh_coordinate, device_offset);
+        TT_FATAL(maybe_hop_directions.has_value(), "All-to-all custom Fabric2D route requires direct ring edges");
+        const auto& hop_directions = *maybe_hop_directions;
+        const uint32_t num_hops = hop_directions.size();
+        TT_FATAL(
+            custom_ring_route_is_representable(mesh_coordinate, device_offset),
+            "All-to-all custom Fabric2D route with {} hops is not representable by the active {}-command header",
+            num_hops,
+            fabric2d_route_capacity);
+        route.num_commands = num_hops;
+        route.packed_commands.resize((num_hops + 7) / 8, 0);
+        route.initial_direction = hop_directions.front();
+
+        // Injection selects hop 0's egress. Each intermediate router consumes the next hop's direction, and the
+        // destination consumes the direction opposite its ingress to drain locally.
+        for (uint32_t command = 0; command + 1 < num_hops; ++command) {
+            set_packed_route_command(route, command, fabric_direction_command(hop_directions[command + 1]));
+        }
+        set_packed_route_command(route, num_hops - 1, fabric_terminal_command(hop_directions.back()));
+        return route;
+    };
+
     const uint32_t max_useful_workers_per_direction =
         is_ring ? preferred_workers_per_direction
                 : std::min(preferred_workers_per_direction, operation_attributes.num_devices - 1);
@@ -212,32 +540,37 @@ AllToAllAsyncGenericProgram::create_at(
                                                      max_useful_workers_per_direction * number_pages_per_packet);
     const bool parallel_workers_are_worthwhile = packets_per_lane >= min_packets_per_lane;
     uint32_t workers_per_direction = 0;
-    if (direction_routing_is_physical && parallel_workers_are_worthwhile) {
+    if (parallel_workers_are_worthwhile) {
         // Deliberately qualify the preferred three-worker schedule before adapting to core capacity. Two workers are
         // a restricted-subdevice fallback for large messages, not a lower size tier; sweeps on full-core systems did
         // not find a message-size region where choosing two workers was better than both legacy and three workers.
         for (uint32_t candidate = max_useful_workers_per_direction; candidate > 0; --candidate) {
-            if (direction_schedule_cores_per_link(candidate) * operation_attributes.num_links <=
+            if (direction_schedule_cores_per_link(candidate, num_direction_groups) * operation_attributes.num_links <=
                 available_worker_cores) {
                 workers_per_direction = candidate;
                 break;
             }
         }
     }
-    // A single direct worker per direction is safe for the generic scatter order on a line. Bank-owned batches can
-    // cyclically block independent direct directions. On a 2D Ring/Torus, routing can choose either equal-cost path
-    // for an antipodal destination, while a direct direction-owned worker opens only one of them. Retain the proven
-    // legacy remote/local schedule for either case when a restricted subdevice cannot fit a mux tier. A muxed stream
-    // is safe on a 2D Ring/Torus because it injects through a concrete physical neighbor; that first hop breaks an
-    // antipodal tie, after which routing from the neighbor continues along the selected arc.
-    if (workers_per_direction == 1 && (use_bank_owned_schedule || (is_fabric_2d && fabric_has_wrap_links))) {
+    // A single direct worker per direction is safe for generic scatter order. Bank-owned batches can cyclically block
+    // independent direct directions, so retain the proven legacy schedule when a restricted subdevice cannot fit a
+    // mux tier. Fabric2D antipodes are safe once streams are grouped by their concrete first hop.
+    if (workers_per_direction == 1 && use_bank_owned_schedule) {
         workers_per_direction = 0;
     }
     const bool use_direction_owned_schedule = workers_per_direction > 0;
+    // Explicit antipode routes are a throughput optimization for the direction-owned schedule. The legacy schedule
+    // stays on canonical Fabric2D routing, which also keeps its per-target runtime record below the Tensix RTA limit.
+    if (is_fabric_2d && !use_direction_owned_schedule) {
+        split_antipode_across_arcs = false;
+    }
+    const uint32_t custom_fabric2d_route_words =
+        is_fabric_2d && split_antipode_across_arcs ? (operation_attributes.num_devices / 2 + 7) / 8 : 0;
     const bool use_worker_mux = workers_per_direction > 1;
     const uint32_t mux_cores_per_direction = workers_per_direction + 1;
-    const uint32_t direction_senders_per_link = mux_num_directions * workers_per_direction + 1;
-    const uint32_t direction_total_cores_per_link = direction_schedule_cores_per_link(workers_per_direction);
+    const uint32_t direction_senders_per_link = num_direction_groups * workers_per_direction + 1;
+    const uint32_t direction_total_cores_per_link =
+        direction_schedule_cores_per_link(workers_per_direction, num_direction_groups);
     const size_t num_senders_per_link = use_direction_owned_schedule
                                             ? direction_senders_per_link
                                             : (available_worker_cores >= 2 * operation_attributes.num_links ? 2 : 1);
@@ -256,23 +589,23 @@ AllToAllAsyncGenericProgram::create_at(
 
     std::vector<CoreCoord> sender_worker_cores;
     sender_worker_cores.reserve(operation_attributes.num_links * num_senders_per_link);
-    std::vector<std::array<CoreCoord, mux_num_directions>> mux_cores(
-        use_worker_mux ? operation_attributes.num_links : 0);
+    std::vector<std::vector<CoreCoord>> mux_cores(
+        use_worker_mux ? operation_attributes.num_links : 0,
+        std::vector<CoreCoord>(use_worker_mux ? num_direction_groups : 0));
     std::set<CoreRange> sender_worker_core_set;
     for (uint32_t link = 0; link < operation_attributes.num_links; ++link) {
         const uint32_t link_base = link * total_cores_per_link;
         if (use_worker_mux) {
-            mux_cores[link][0] = all_worker_cores[link_base];
-            mux_cores[link][1] = all_worker_cores[link_base + mux_cores_per_direction];
-            for (uint32_t worker = 0; worker < workers_per_direction; ++worker) {
-                sender_worker_cores.push_back(all_worker_cores[link_base + 1 + worker]);
-            }
-            for (uint32_t worker = 0; worker < workers_per_direction; ++worker) {
-                sender_worker_cores.push_back(all_worker_cores[link_base + mux_cores_per_direction + 1 + worker]);
+            for (uint32_t direction_group = 0; direction_group < num_direction_groups; ++direction_group) {
+                const uint32_t direction_base = link_base + direction_group * mux_cores_per_direction;
+                mux_cores[link][direction_group] = all_worker_cores[direction_base];
+                for (uint32_t worker = 0; worker < workers_per_direction; ++worker) {
+                    sender_worker_cores.push_back(all_worker_cores[direction_base + 1 + worker]);
+                }
             }
             sender_worker_cores.push_back(all_worker_cores[link_base + direction_total_cores_per_link - 1]);
         } else if (use_direction_owned_schedule) {
-            for (uint32_t worker = 0; worker < mux_num_directions * workers_per_direction; ++worker) {
+            for (uint32_t worker = 0; worker < num_direction_groups * workers_per_direction; ++worker) {
                 sender_worker_cores.push_back(all_worker_cores[link_base + worker]);
             }
             sender_worker_cores.push_back(all_worker_cores[link_base + direction_total_cores_per_link - 1]);
@@ -351,17 +684,45 @@ AllToAllAsyncGenericProgram::create_at(
         completion_flags[i].resize(operation_attributes.num_links);
     }
     const size_t local_sender_stream = num_senders_per_link - 1;
-    uint32_t positive_target_index = 0;
-    uint32_t negative_target_index = 0;
+    std::vector<uint32_t> direction_target_indices(num_direction_groups, 0);
+    auto direction_group_for_offset = [&](int32_t device_offset) -> uint32_t {
+        if (!is_fabric_2d) {
+            return device_offset < 0 ? 1 : 0;
+        }
+        const bool antipodal =
+            split_antipode_across_arcs && std::abs(device_offset) * 2 == operation_attributes.num_devices;
+        const int32_t route_offset = antipodal ? (device_offset > 0 ? 1 : -1) : device_offset;
+        const auto connection_coord = ttnn::ccl::get_physical_neighbor_from_physical_coord(
+            tensor_args.input_tensor,
+            mesh_coordinate,
+            route_offset,
+            effective_topology,
+            operation_attributes.cluster_axis);
+        TT_FATAL(connection_coord.has_value(), "No all-to-all target at device offset {}", device_offset);
+        const auto connection_node = device->get_fabric_node_id(*connection_coord);
+        const auto direction =
+            tt::tt_fabric::get_eth_forwarding_direction(sender_device_fabric_node_id, connection_node);
+        TT_FATAL(
+            direction.has_value(),
+            "No Fabric2D forwarding direction from all-to-all source {} to target {}",
+            sender_device_fabric_node_id,
+            connection_node);
+        const uint32_t direction_index = static_cast<uint32_t>(*direction);
+        TT_FATAL(
+            direction_index < physical_direction_to_group.size() && physical_direction_to_group[direction_index] >= 0,
+            "Fabric2D direction {} is absent from the collective all-to-all schedule",
+            direction_index);
+        return static_cast<uint32_t>(physical_direction_to_group[direction_index]);
+    };
     auto sender_stream_for_offset = [&](int32_t device_offset) {
         if (device_offset == 0 && num_senders_per_link > 1) {
             return local_sender_stream;
         }
         if (use_direction_owned_schedule) {
-            if (device_offset < 0) {
-                return size_t{workers_per_direction + (negative_target_index++ % workers_per_direction)};
-            }
-            return size_t{positive_target_index++ % workers_per_direction};
+            const uint32_t direction_group = direction_group_for_offset(device_offset);
+            return static_cast<size_t>(
+                direction_group * workers_per_direction +
+                (direction_target_indices[direction_group]++ % workers_per_direction));
         }
         return size_t{0};
     };
@@ -407,7 +768,8 @@ AllToAllAsyncGenericProgram::create_at(
             for (uint32_t target_index = 0; target_index < ring_ordered_offsets.size(); ++target_index) {
                 const int32_t device_offset = ring_ordered_offsets[target_index];
                 const bool local = device_offset == 0;
-                const bool antipodal = !local && std::abs(device_offset) * 2 == operation_attributes.num_devices;
+                const bool antipodal = !local && split_antipode_across_arcs &&
+                                       std::abs(device_offset) * 2 == operation_attributes.num_devices;
                 const int32_t half_ring = static_cast<int32_t>(operation_attributes.num_devices / 2);
                 for (uint32_t bank_phase = 0; bank_phase < max_banks_per_link; ++bank_phase) {
                     // Split an even Ring's antipodal destination evenly across both arcs. Source parity swaps which
@@ -415,7 +777,8 @@ AllToAllAsyncGenericProgram::create_at(
                     // retain reverse bank order to avoid matching the positive direction's receiver-bank phase.
                     const int32_t routed_offset =
                         antipodal ? (((bank_phase + device_index) % 2 == 0) ? half_ring : -half_ring) : device_offset;
-                    const uint32_t direction_base = routed_offset < 0 ? workers_per_direction : 0;
+                    const uint32_t direction_base =
+                        local ? 0 : direction_group_for_offset(routed_offset) * workers_per_direction;
                     const uint32_t bank_in_link =
                         !antipodal && routed_offset < 0 ? max_banks_per_link - 1 - bank_phase : bank_phase;
                     const size_t sender_stream =
@@ -439,9 +802,15 @@ AllToAllAsyncGenericProgram::create_at(
                     is_ring ? operation_attributes.num_devices : (operation_attributes.num_devices + 1) / 2;
                 for (uint32_t group = 0; group < num_destination_groups; ++group) {
                     for (uint32_t bank_phase = 0; bank_phase < max_banks_per_link; ++bank_phase) {
-                        const bool negative_direction_stream = use_direction_owned_schedule &&
-                                                               stream >= workers_per_direction &&
-                                                               stream < mux_num_directions * workers_per_direction;
+                        bool negative_direction_stream = false;
+                        if (use_direction_owned_schedule && stream < local_sender_stream) {
+                            const uint32_t direction_group = stream / workers_per_direction;
+                            const uint32_t direction = direction_group_to_physical_direction[direction_group];
+                            negative_direction_stream = is_fabric_2d
+                                                            ? direction == tt::tt_fabric::eth_chan_directions::WEST ||
+                                                                  direction == tt::tt_fabric::eth_chan_directions::NORTH
+                                                            : direction_group == 1;
+                        }
                         // Walk opposite directions in opposite bank orders. This preserves each same-bank contiguous
                         // packet and avoids making both directions contend for the same bank at the same time.
                         const uint32_t bank_in_link =
@@ -514,7 +883,6 @@ AllToAllAsyncGenericProgram::create_at(
             }
         }
     }
-
     std::vector<CoreRangeSet> sender_stream_core_ranges(num_senders_per_link);
     for (uint32_t core_id = 0; core_id < sender_worker_cores.size(); ++core_id) {
         const auto& core = sender_worker_cores[core_id];
@@ -529,20 +897,16 @@ AllToAllAsyncGenericProgram::create_at(
     if (use_direction_owned_schedule) {
         // Direction indices follow {East, West, North, South}. Axis 1 is horizontal and axis 0 is vertical.
         // A 1D connection only needs distinct non-zero masks; its low-latency header routes by signed hop count.
-        const uint32_t positive_direction = !is_fabric_2d || cluster_axis == 1 ? 0 : 3;
-        const uint32_t negative_direction = !is_fabric_2d || cluster_axis == 1 ? 1 : 2;
-        const bool has_positive_connection =
-            is_fabric_2d ? fabric_directions[positive_direction] : forward_coord.has_value();
-        const bool has_negative_connection =
-            is_fabric_2d ? fabric_directions[negative_direction] : backward_coord.has_value();
-        if (has_positive_connection) {
-            for (uint32_t worker = 0; worker < workers_per_direction; ++worker) {
-                sender_stream_direction_masks[worker] = 1U << positive_direction;
+        for (uint32_t direction_group = 0; direction_group < num_direction_groups; ++direction_group) {
+            const uint32_t direction = direction_group_to_physical_direction[direction_group];
+            const bool has_connection =
+                is_fabric_2d ? current_direction_connection_nodes[direction].has_value()
+                             : (direction_group == 0 ? forward_coord.has_value() : backward_coord.has_value());
+            if (!has_connection) {
+                continue;
             }
-        }
-        if (has_negative_connection) {
             for (uint32_t worker = 0; worker < workers_per_direction; ++worker) {
-                sender_stream_direction_masks[workers_per_direction + worker] = 1U << negative_direction;
+                sender_stream_direction_masks[direction_group * workers_per_direction + worker] = 1U << direction;
             }
         }
     } else {
@@ -566,21 +930,47 @@ AllToAllAsyncGenericProgram::create_at(
 
     if (use_worker_mux) {
         for (uint32_t link = 0; link < operation_attributes.num_links; ++link) {
-            const std::array<std::optional<MeshCoordinate>, mux_num_directions> direction_neighbors = {
-                forward_coord, backward_coord};
-            for (uint32_t direction = 0; direction < mux_num_directions; ++direction) {
-                const uint32_t representative_stream = direction * workers_per_direction;
+            for (uint32_t direction_group = 0; direction_group < num_direction_groups; ++direction_group) {
+                const uint32_t representative_stream = direction_group * workers_per_direction;
                 if (sender_stream_direction_masks[representative_stream] == 0) {
                     continue;
                 }
-                TT_FATAL(direction_neighbors[direction].has_value(), "Active all-to-all mux direction has no neighbor");
+                const uint32_t physical_direction = direction_group_to_physical_direction[direction_group];
+                std::optional<tt::tt_fabric::FabricNodeId> connection_node;
+                if (is_fabric_2d) {
+                    connection_node = current_direction_connection_nodes[physical_direction];
+                } else {
+                    const auto& neighbor_coord = direction_group == 0 ? forward_coord : backward_coord;
+                    if (neighbor_coord.has_value()) {
+                        connection_node = device->get_fabric_node_id(*neighbor_coord);
+                    }
+                }
+                TT_FATAL(connection_node.has_value(), "Active all-to-all mux direction has no connection node");
+                uint32_t connection_link = link;
+                // Fabric1D wrap links are not represented in the routing table; preserve their original link index.
+                if (is_fabric_2d) {
+                    const auto valid_links =
+                        tt::tt_fabric::get_forwarding_link_indices(sender_device_fabric_node_id, *connection_node);
+                    TT_FATAL(
+                        !valid_links.empty(),
+                        "No Fabric2D forwarding links from all-to-all source {} to mux neighbor {}",
+                        sender_device_fabric_node_id,
+                        *connection_node);
+                    TT_FATAL(
+                        link < valid_links.size(),
+                        "All-to-all link {} is unavailable for Fabric2D mux direction {} ({} link(s) available)",
+                        link,
+                        physical_direction,
+                        valid_links.size());
+                    connection_link = valid_links[link];
+                }
                 tt::tt_fabric::add_fabric_mux_v2_to_program(
                     program,
                     mux_config,
-                    mux_cores[link][direction],
+                    mux_cores[link][direction_group],
                     sender_device_fabric_node_id,
-                    device->get_fabric_node_id(*direction_neighbors[direction]),
-                    link);
+                    *connection_node,
+                    connection_link);
             }
         }
     }
@@ -607,12 +997,13 @@ AllToAllAsyncGenericProgram::create_at(
             *sender_device_fabric_node_id.mesh_id,       // source_mesh_id
             is_fabric_2d,                                // is_fabric_2d
             sender_stream_direction_masks[stream],       // fabric_direction_mask
-            number_pages_per_packet                      // max_pages_per_packet
+            number_pages_per_packet,                     // max_pages_per_packet
+            custom_fabric2d_route_words                  // custom_fabric2d_route_words
         };
 
         tt::tt_metal::TensorAccessorArgs(tensor_return_value.buffer())
             .append_to(sender_writer_kernel_config.compile_args);
-        const bool stream_uses_mux = use_worker_mux && stream < mux_num_directions * workers_per_direction &&
+        const bool stream_uses_mux = use_worker_mux && stream < num_direction_groups * workers_per_direction &&
                                      sender_stream_direction_masks[stream] != 0;
         sender_writer_kernel_config.compile_args.push_back(stream_uses_mux);
         sender_writer_kernel_config.compile_args.push_back(workers_per_direction);
@@ -627,13 +1018,26 @@ AllToAllAsyncGenericProgram::create_at(
 
     CoreRange sender_box = sender_worker_core_range.bounding_box();
     // Swap start and end coord
-    const uint32_t mcast_dest_noc_start_x = device->worker_core_from_logical_core(sender_box.end_coord).x;
-    const uint32_t mcast_dest_noc_end_x = device->worker_core_from_logical_core(sender_box.start_coord).x;
-    const uint32_t mcast_dest_noc_start_y = device->worker_core_from_logical_core(sender_box.end_coord).y;
-    const uint32_t mcast_dest_noc_end_y = device->worker_core_from_logical_core(sender_box.start_coord).y;
+    // MeshDevice translates through a representative chip, which is insufficient when Galaxy chips have different
+    // Tensix harvesting maps. These addresses are consumed by the program at mesh_coordinate, so translate them on
+    // that chip specifically.
+    const uint32_t mcast_dest_noc_start_x = local_device->worker_core_from_logical_core(sender_box.end_coord).x;
+    const uint32_t mcast_dest_noc_end_x = local_device->worker_core_from_logical_core(sender_box.start_coord).x;
+    const uint32_t mcast_dest_noc_start_y = local_device->worker_core_from_logical_core(sender_box.end_coord).y;
+    const uint32_t mcast_dest_noc_end_y = local_device->worker_core_from_logical_core(sender_box.start_coord).y;
     const uint32_t mcast_size = sender_box.size();
 
-    auto drain_sync_core = device->worker_core_from_logical_core(sender_worker_cores[0]);
+    const CoreCoord drain_sync_logical_core = sender_worker_cores[0];
+    const auto drain_sync_core = local_device->worker_core_from_logical_core(drain_sync_logical_core);
+
+    CustomFabric2DRoute positive_antipode_route;
+    CustomFabric2DRoute negative_antipode_route;
+    if (is_fabric_2d && split_antipode_across_arcs) {
+        const int32_t half_ring = static_cast<int32_t>(operation_attributes.num_devices / 2);
+        positive_antipode_route = build_custom_ring_route(half_ring);
+        negative_antipode_route = build_custom_ring_route(-half_ring);
+    }
+    const CustomFabric2DRoute no_custom_route;
 
     for (uint32_t core_id = 0; core_id < sender_worker_cores.size(); ++core_id) {
         const auto& core = sender_worker_cores[core_id];
@@ -692,21 +1096,61 @@ AllToAllAsyncGenericProgram::create_at(
                 const auto target_node_id = device->get_fabric_node_id(target_coord.value());
                 sender_writer_rt_args.push_back(*target_node_id.mesh_id);
                 sender_writer_rt_args.push_back(target_node_id.chip_id);
+                // The map is exchanged once on cache miss so every host uses the destination chip's own harvested
+                // logical-to-virtual translation, including for remote-host targets.
+                const size_t cores_per_node =
+                    static_cast<size_t>(logical_worker_grid_size.x) * logical_worker_grid_size.y;
+                const size_t target_node_index = target_coord->to_linear_index(device->shape());
+                const size_t target_core_index = target_node_index * cores_per_node +
+                                                 drain_sync_logical_core.y * logical_worker_grid_size.x +
+                                                 drain_sync_logical_core.x;
+                TT_FATAL(
+                    target_core_index < global_worker_virtual_core_map.size(),
+                    "Missing worker-core mapping for all-to-all target {} logical core {}",
+                    target_node_id,
+                    drain_sync_logical_core);
+                const auto target_drain_sync_core = global_worker_virtual_core_map[target_core_index];
+                sender_writer_rt_args.push_back(target_drain_sync_core.x);
+                sender_writer_rt_args.push_back(target_drain_sync_core.y);
             } else {
                 // The low-latency 1D header uses the second route field as a hop count.
                 sender_writer_rt_args.push_back(0);
                 sender_writer_rt_args.push_back(std::abs(device_offset));
             }
+
+            const CustomFabric2DRoute* custom_route = &no_custom_route;
+            if (is_fabric_2d && split_antipode_across_arcs &&
+                std::abs(device_offset) * 2 == operation_attributes.num_devices) {
+                custom_route = device_offset > 0 ? &positive_antipode_route : &negative_antipode_route;
+            }
+            if (custom_fabric2d_route_words > 0) {
+                TT_FATAL(
+                    custom_route->packed_commands.empty() ||
+                        custom_route->packed_commands.size() == custom_fabric2d_route_words,
+                    "All-to-all custom route ABI expected {} packed words, got {}",
+                    custom_fabric2d_route_words,
+                    custom_route->packed_commands.size());
+                sender_writer_rt_args.push_back(custom_route->num_commands);
+                sender_writer_rt_args.push_back(static_cast<uint32_t>(custom_route->initial_direction));
+                if (custom_route->packed_commands.empty()) {
+                    sender_writer_rt_args.insert(sender_writer_rt_args.end(), custom_fabric2d_route_words, 0);
+                } else {
+                    sender_writer_rt_args.insert(
+                        sender_writer_rt_args.end(),
+                        custom_route->packed_commands.begin(),
+                        custom_route->packed_commands.end());
+                }
+            }
         }
         const size_t sender_stream = core_id % num_senders_per_link;
         const bool is_remote_sender = sender_stream != local_sender_stream || num_senders_per_link == 1;
-        const bool stream_uses_mux = use_worker_mux && sender_stream < mux_num_directions * workers_per_direction &&
+        const bool stream_uses_mux = use_worker_mux && sender_stream < num_direction_groups * workers_per_direction &&
                                      sender_stream_direction_masks[sender_stream] != 0;
         if (stream_uses_mux) {
             const uint32_t link = core_id / num_senders_per_link;
             const uint32_t direction = sender_stream / workers_per_direction;
             const uint32_t worker = sender_stream % workers_per_direction;
-            const auto mux_virtual_core = device->worker_core_from_logical_core(mux_cores[link][direction]);
+            const auto mux_virtual_core = local_device->worker_core_from_logical_core(mux_cores[link][direction]);
             const auto flow_control_sem_id = tt::tt_metal::CreateSemaphore(program, core, 0);
             const auto teardown_sem_id = tt::tt_metal::CreateSemaphore(program, core, 0);
             mux_config.append_client_connection_rt_args(
@@ -715,31 +1159,89 @@ AllToAllAsyncGenericProgram::create_at(
                 {.flow_control_sem_id = flow_control_sem_id, .teardown_sem_id = teardown_sem_id},
                 sender_writer_rt_args);
         } else if (is_fabric_2d) {
+            // Open one routed connection for every physical first-hop direction used by this stream. Logical axes can
+            // fold through the physical mesh, so neither the logical sign nor a single link index identifies all valid
+            // sender planes. The manager tags each connection by physical direction for the kernel's route lookup.
+            std::vector<tt::tt_fabric::FabricNodeId> connection_nodes;
+            std::unordered_set<tt::tt_fabric::eth_chan_directions> used_directions;
             if (is_remote_sender) {
-                // Append connections in the same {E, W, N, S} order as the compile-time direction mask.
-                size_t neighbor_index = 0;
-                for (uint32_t direction = 0; direction < fabric_directions.size(); ++direction) {
-                    if (!fabric_directions[direction]) {
+                for (const int32_t device_offset : device_offsets[sender_stream]) {
+                    if (device_offset == 0) {
                         continue;
                     }
-                    const auto& neighbor_coord = fabric_neighbors[neighbor_index++];
-                    if ((sender_stream_direction_masks[sender_stream] & (1U << direction)) == 0) {
-                        continue;
+                    const auto target_coord = ttnn::ccl::get_physical_neighbor_from_physical_coord(
+                        tensor_args.input_tensor,
+                        mesh_coordinate,
+                        device_offset,
+                        effective_topology,
+                        operation_attributes.cluster_axis);
+                    TT_FATAL(target_coord.has_value(), "No all-to-all target at device offset {}", device_offset);
+                    auto connection_coord = *target_coord;
+                    if (split_antipode_across_arcs && std::abs(device_offset) * 2 == operation_attributes.num_devices) {
+                        const auto initial_neighbor = ttnn::ccl::get_physical_neighbor_from_physical_coord(
+                            tensor_args.input_tensor,
+                            mesh_coordinate,
+                            device_offset > 0 ? 1 : -1,
+                            effective_topology,
+                            operation_attributes.cluster_axis);
+                        TT_FATAL(
+                            initial_neighbor.has_value(),
+                            "No initial ring neighbor for antipode offset {}",
+                            device_offset);
+                        connection_coord = *initial_neighbor;
                     }
-                    tt::tt_fabric::append_fabric_connection_rt_args(
+                    const auto target_node = device->get_fabric_node_id(connection_coord);
+                    const auto direction =
+                        tt::tt_fabric::get_eth_forwarding_direction(sender_device_fabric_node_id, target_node);
+                    TT_FATAL(
+                        direction.has_value(),
+                        "No Fabric2D forwarding direction from all-to-all source {} to target {}",
                         sender_device_fabric_node_id,
-                        device->get_fabric_node_id(neighbor_coord),
-                        core_id / num_senders_per_link,
-                        program,
-                        {core},
-                        sender_writer_rt_args);
+                        target_node);
+                    if (used_directions.insert(*direction).second) {
+                        connection_nodes.push_back(target_node);
+                    }
                 }
             }
+            TT_FATAL(
+                connection_nodes.size() <= max_fabric2d_sender_connections,
+                "FABRIC_2D all-to-all needs {} physical first-hop connections, but the manager supports {}",
+                connection_nodes.size(),
+                max_fabric2d_sender_connections);
+            std::vector<uint32_t> connection_links;
+            connection_links.reserve(connection_nodes.size());
+            const uint32_t requested_link = core_id / num_senders_per_link;
+            for (const auto& connection_node : connection_nodes) {
+                const auto valid_links =
+                    tt::tt_fabric::get_forwarding_link_indices(sender_device_fabric_node_id, connection_node);
+                TT_FATAL(
+                    !valid_links.empty(),
+                    "No Fabric2D forwarding links from all-to-all source {} to first hop {}",
+                    sender_device_fabric_node_id,
+                    connection_node);
+                TT_FATAL(
+                    requested_link < valid_links.size(),
+                    "All-to-all link {} is unavailable for Fabric2D first hop {} ({} link(s) available)",
+                    requested_link,
+                    connection_node,
+                    valid_links.size());
+                connection_links.push_back(valid_links[requested_link]);
+            }
+            sender_writer_rt_args.push_back(static_cast<uint32_t>(connection_nodes.size()));
+            tt::tt_fabric::append_routing_plane_connection_manager_rt_args(
+                sender_device_fabric_node_id,
+                connection_nodes,
+                connection_links,
+                program,
+                sender_writer_kernel_ids[sender_stream],
+                core,
+                sender_writer_rt_args,
+                tt::tt_fabric::FabricApiType::Linear);
         } else {
             const bool owns_positive_direction = !use_direction_owned_schedule || sender_stream < workers_per_direction;
             const bool owns_negative_direction =
-                !use_direction_owned_schedule ||
-                (sender_stream >= workers_per_direction && sender_stream < mux_num_directions * workers_per_direction);
+                !use_direction_owned_schedule || (sender_stream >= workers_per_direction &&
+                                                  sender_stream < logical_num_directions * workers_per_direction);
             const bool with_forward = is_remote_sender && owns_positive_direction && forward_coord.has_value();
             const bool with_backward = is_remote_sender && owns_negative_direction && backward_coord.has_value();
             sender_writer_rt_args.push_back(with_forward);
