@@ -19,11 +19,12 @@ template <EltwiseBinaryType eltwise_binary_type, std::uint32_t num_tiles, MathFi
 inline void rmsnorm_bcast_scalar_dest_reuse_configure_mop(const std::uint32_t num_faces = 4, const std::uint32_t acc_to_dest = 0)
 {
     LLK_ASSERT(num_faces == 1 || num_faces == 2 || num_faces == 4, "num_faces must be 1, 2, or 4");
-    constexpr bool high_fidelity     = is_high_fidelity(math_fidelity);
-    constexpr std::uint32_t addr_mod = ADDR_MOD_0;
-    std::uint32_t innerloop          = 16 >> 3; // 8 rows per eltwise op at a time.
-    std::uint32_t outerloop          = num_faces;
-    constexpr auto broadcast_type    = p_elwise::SRCB_BCAST_ALL;
+    constexpr bool high_fidelity  = is_high_fidelity(math_fidelity);
+    constexpr auto broadcast_type = p_elwise::SRCB_BCAST_ALL;
+    // The loop bounds are passed straight to ckernel_template below (num_tiles/num_faces,
+    // or num_faces/fidelity on the high-fidelity ELWMUL branch); the addr_mod is selected
+    // per-instruction. The three locals that used to stand in for them here were never
+    // read and tripped -Werror=unused-variable once a tt-llk test compiled this header.
 
     // Scalar broadcast should not Clear B within a mop.  This is controlled outside of MOP.
     if constexpr (eltwise_binary_type == EltwiseBinaryType::ELWADD)
@@ -87,8 +88,9 @@ template <
     bool clear_dest = false>
 inline void _llk_math_rmsnorm_bcast_scalar_dest_reuse_(std::uint32_t src_index, std::uint32_t dst_index)
 {
-    constexpr bool high_fidelity          = is_high_fidelity(math_fidelity);
-    constexpr std::uint32_t ZERO_ACC_MODE = p_zeroacc::CLR_16;
+    constexpr bool high_fidelity = is_high_fidelity(math_fidelity);
+    // The ZEROACC mode is chosen per DstSync branch below (CLR_ALL for SyncFull, CLR_HALF
+    // for SyncHalf); the CLR_16 constant that used to sit here was never read.
 
     math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>(src_index);
     rmsnorm_bcast_scalar_reuse_dest_as_src();
