@@ -1312,8 +1312,12 @@ assert _BINARY_EDGE_OPS, (
 #   the multiply. The finite poles agree exactly (div(-2, ±1/64) = ∓128, every ±inf lines
 #   up), so it is specifically the indeterminate form.
 #
-#   0**0 returns 0 where C, torch and the golden give 1. pow evaluates exp(b·ln a), so a
-#   composition artifact rather than anything the ISA prescribes.
+# CLOSED — 0**0 returned 0 where C, torch and the golden give 1, and 0**-0.0 returned inf.
+#   Both were the same composition artifact: pow evaluates exp(b·ln a), so base == 0 formed
+#   0 * -inf = NaN, exp(NaN) collapsed to +0, and the kernel's v_if(val < 0) then ran on a
+#   NaN -- undefined per VectorUnit's SFPSETCC contract, which is why the two inputs
+#   disagreed. calculate_sfpu_binary_power now ends in an IEEE pow(x, 0) == 1 guard, so
+#   SfpuElwpow no longer appears in the tables below.
 #
 # Those groups are the classes the probe partitions into: documented is
 # _EDGE_CLASS_NEGATIVE_ZERO; open are _EDGE_CLASS_BOTH_ZERO (indeterminate forms, and 0**0)
@@ -1341,14 +1345,6 @@ _BINARY_EDGE_COMBINATIONS = {
         (DataFormat.Float16_b, DataFormat.Float16_b, DestAccumulation.Yes),
         (DataFormat.Float16_b, DataFormat.Float32, DestAccumulation.No),
         (DataFormat.Float32, DataFormat.Float16_b, DestAccumulation.Yes),
-    ),
-    MathOperation.SfpuElwpow: (
-        (DataFormat.Float16_b, DataFormat.Float16_b, DestAccumulation.No),
-        (DataFormat.Float16_b, DataFormat.Float16_b, DestAccumulation.Yes),
-        (DataFormat.Float16_b, DataFormat.Float32, DestAccumulation.No),
-        (DataFormat.Float16_b, DataFormat.Float32, DestAccumulation.Yes),
-        (DataFormat.Float32, DataFormat.Float16_b, DestAccumulation.Yes),
-        (DataFormat.Float32, DataFormat.Float32, DestAccumulation.Yes),
     ),
     MathOperation.SfpuBinaryFmod: (
         (DataFormat.Float16_b, DataFormat.Float16_b, DestAccumulation.No),
@@ -1385,10 +1381,6 @@ _BINARY_EDGE_REASON = {
         "indeterminate 0 x inf as div, and equally unexplained by the ISA.",
         _EDGE_CLASS_NEGATIVE_ZERO: f"xlogy(0, tiny) returns +0.0, not -0.0 "
         f"({_ZERO_SIGN_ISA_NOTE}).",
-    },
-    MathOperation.SfpuElwpow: {
-        _EDGE_CLASS_BOTH_ZERO: "0**0 returns 0; C, torch and the golden all give 1. Not "
-        "explained by the ISA — pow evaluates exp(b·ln a), so this is composition.",
     },
     MathOperation.SfpuBinaryFmod: {
         _EDGE_CLASS_BOTH_ZERO: "fmod(0, 0) returns inf, not nan.",
