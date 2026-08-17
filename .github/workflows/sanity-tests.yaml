@@ -197,6 +197,11 @@ on:
         type: boolean
         default: true
         description: "Publish the AI run summary. A caller that invokes this workflow more than once per run must pass false on all but one invocation, or the reports collide on the artifact name."
+      use-artifacts-from-run:
+        required: false
+        type: string
+        default: ""
+        description: "TRIAL ONLY - DO NOT MERGE. Run ID to download build artifacts from (skips build)."
   push:
     branches: ["main"]
   schedule:
@@ -251,6 +256,7 @@ jobs:
       use-system-sfpi: true
       ref: ${{ inputs.ref || github.sha }}
       checkout-filter: tree:0
+      use-artifacts-from-run: ${{ inputs.use-artifacts-from-run || '' }}
 
   resolve-docker-pull-refs:
     needs: [check-harbor, build-artifact]
