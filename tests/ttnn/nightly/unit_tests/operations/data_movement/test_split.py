@@ -10,7 +10,7 @@ import torch
 
 import ttnn
 from models.common.utility_functions import comp_pcc
-from tests.ttnn.utils_for_testing import assert_with_pcc
+from tests.ttnn.utils_for_testing import assert_equal, assert_with_pcc
 
 layouts = [ttnn.ROW_MAJOR_LAYOUT, ttnn.TILE_LAYOUT]
 dtypes = [torch.bfloat16, torch.float32]
@@ -201,3 +201,28 @@ def test_split_negative_dim_with_split_sizes_list(device, layout, dtype):
             output.shape == torch_result.shape
         ), f"Output shape {output.shape} does not match torch shape {torch_result.shape}"
         assert_with_pcc(torch_result, output, 0.9999)
+
+
+# Cache-hit dispatch of the TILE split must re-emit reader/writer per-core scalars, not just addresses.
+def test_split_tile_cache_hit_per_core_scalars(device):
+    shape = (1, 1, 32, 128256)
+    split_size = 64128
+    dim = 3
+
+    torch_a = torch.rand(shape, dtype=torch.bfloat16)
+    torch_b = torch.rand(shape, dtype=torch.bfloat16)
+
+    tt_a = ttnn.from_torch(torch_a, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    tt_b = ttnn.from_torch(torch_b, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+    entries_after_first = None
+    for tt_in, torch_in in ((tt_a, torch_a), (tt_b, torch_b)):
+        outputs = ttnn.split(tt_in, split_size, dim=dim)
+        # split is a bit-exact copy; assert_equal catches single-slot staleness that PCC would miss.
+        for exp, got in zip(torch.split(torch_in, split_size, dim=dim), outputs):
+            assert_equal(exp, ttnn.to_torch(got))
+        # 2nd call must reuse the 1st's cache entries.
+        if entries_after_first is None:
+            entries_after_first = device.num_program_cache_entries()
+        else:
+            assert device.num_program_cache_entries() == entries_after_first
