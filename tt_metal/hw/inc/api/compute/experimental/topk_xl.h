@@ -356,17 +356,26 @@ ALWI void topk_xl_separate_indices_row_major_advance_chunk_base() {
  * letting the reader skip the rest of a column at the first zero word.
  *
  * APPROXIMATION_MODE is pinned to false (integer-encoded data, no approx path).
- * int32_mode selects raw INT32 load/store inside the sort so small packed
- * integers aren't treated as denormals and flushed to zero by the FP32 path.
+ * The fused (bf16 value | u16 index) words are always moved as INT32, so small
+ * packed integers are never subject to FP32 denormal flush.
  *
- * Unlike topk_xl_local_sort, this does NOT issue llk_unpack_set_srcb_dummy_valid:
+ * With early_exit_K64 = true this does NOT issue llk_unpack_set_srcb_dummy_valid:
  * the early-exit column sort never consumes a real SrcB operand, so the dummy
- * valid is dead config. Dropping it saves one UNPACK-thread issue per call.
+ * valid is dead config, and dropping it saves one UNPACK-thread issue per call.
+ * The default (full-sort) instantiation runs the same network as
+ * topk_xl_local_sort and does issue it.
+ *
+ * early_exit_K64 requires K >= 1024; K = 512 is rejected by static_assert.
  */
-template <std::uint32_t K, bool early_exit_K64 = false, bool int32_mode = false>
+template <std::uint32_t K, bool early_exit_K64 = false>
 ALWI void topk_xl_local_sort_generic(std::uint32_t idst, bool ascending) {
-    MATH((
-        llk_math_eltwise_unary_sfpu_topk_xl_local_sort_generic<K, false, early_exit_K64, int32_mode>(idst, ascending)));
+    // The early-exit column sort never consumes a real SrcB operand, so the dummy
+    // valid is dead config there and is skipped. The full-sort instantiation runs
+    // the same network as topk_xl_local_sort and needs it.
+    if constexpr (!early_exit_K64) {
+        UNPACK((llk_unpack_set_srcb_dummy_valid()));
+    }
+    MATH((llk_math_eltwise_unary_sfpu_topk_xl_local_sort_generic<K, false, early_exit_K64>(idst, ascending)));
 }
 
 /**
@@ -386,18 +395,19 @@ ALWI void topk_xl_local_sort_generic(std::uint32_t idst, bool ascending) {
  */
 template <bool fused = true>
 ALWI void topk_xl_reinit_mop_after_copy() {
-    MATH((ckernel::sfpu::topk_mop_config<fused>()));
+    MATH((llk_math_eltwise_unary_sfpu_topk_xl_reinit_mop_after_copy<fused>()));
 }
 
 /**
  * Restore the subset of unfused TopK state clobbered by copy_tile_init.
  *
  * In addition to the shared MOP Expander, unfused rebuild consumes
- * ADDR_MOD_2/3, which datacopy rewrites. The remaining TopK ADDR_MODs and SFPU
+ * ADDR_MOD_3, which copy init rewrites, and ADDR_MOD_2, which it (re)establishes
+ * for the unfused stride in case the preceding phase was fused. The remaining TopK ADDR_MODs and SFPU
  * index-tracking state stay live, so a full topk_xl_init is unnecessary.
  */
 ALWI void topk_xl_reinit_unfused_rebuild_after_copy() {
-    MATH((ckernel::sfpu::topk_reinit_unfused_rebuild_after_copy()));
+    MATH((llk_math_eltwise_unary_sfpu_topk_xl_reinit_unfused_rebuild_after_copy()));
 }
 
 }  // namespace ckernel

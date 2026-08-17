@@ -145,9 +145,11 @@ inline void topk_mop_config()
     tmpl.program();
 }
 
-// copy_tile_init rewrites ADDR_MOD_2/3 for datacopy. The unfused partner
-// rebuild needs those two folded strides restored, but all other TopK state
-// (ADDR_MOD_1/4/5/6, index tracking, and formats) remains live.
+// _llk_math_topk_xl_copy_init_ rewrites ADDR_MOD_0 and ADDR_MOD_3 for datacopy,
+// so ADDR_MOD_3 must be restored here. ADDR_MOD_2 is not clobbered by copy init;
+// it is (re)established because the unfused rebuild needs the unfused stride and
+// the preceding phase may have been fused. All other TopK state (ADDR_MOD_1/4/5/6,
+// index tracking, and formats) remains live, so a full topk_xl_init is unnecessary.
 inline void topk_reinit_unfused_rebuild_after_copy()
 {
     addr_mod_t {
@@ -345,7 +347,7 @@ inline void set_dst_write_addr_offset(std::uint32_t addr)
 // Load 16 rows × 2 strips into LREG0..LREG7 (fused path).
 //   group 1: LREG0..3 at base+{0,4,8,12}
 //   group 2: LREG4..7 at base+group_2_offset+{0,4,8,12}
-template <int group_2_offset = 16, bool use_int32 = false>
+template <int group_2_offset = 16>
 inline void load16_rows_x2()
 {
     // The fused packed [value|index] word is an opaque sort key; move it with
@@ -371,7 +373,7 @@ inline void load16_rows_x2()
 //   16 → +16 (one half face row)
 //   32 → +32 (one face row)
 //   48 → +48 = 32 + 16 (folds the trailing +16 INCRWC into the store)
-template <int group_2_offset = 16, int inc_dst_addr = 0, bool use_int32 = false>
+template <int group_2_offset = 16, int inc_dst_addr = 0>
 inline void store16_rows_x2()
 {
     // The fused packed [value|index] word is an opaque sort key; move it with
@@ -1202,7 +1204,7 @@ inline void canonical_big_block_with_replay(bool dir)
 // `set_dst_write_addr_offset(tile_offset + (col ? 0 : 2))` flips the Dst
 // pointer between the even and odd columns of the current pair of DST tiles.
 // Forward declaration — defined below the K=2048 optimized body.
-template <std::uint32_t K, bool APPROXIMATION_MODE, bool early_exit_K64 = false, bool int32_mode = false>
+template <std::uint32_t K, bool APPROXIMATION_MODE, bool early_exit_K64 = false>
 inline void _topk_xl_local_sort_generic_(std::uint32_t dst_index, bool ascending);
 
 template <std::uint32_t K, bool APPROXIMATION_MODE>
@@ -1457,14 +1459,17 @@ inline void _topk_xl_local_sort_(const std::uint32_t dst_index, const bool ascen
 // The K=2048 case continues to be routed to the K=2048 fast path by
 // `_topk_xl_local_sort_`'s `if constexpr (K != 2048)` guard, so the
 // codegen here is exercised only by K=512 and K=1024.
-template <std::uint32_t K, bool APPROXIMATION_MODE, bool early_exit_K64, bool int32_mode>
+template <std::uint32_t K, bool APPROXIMATION_MODE, bool early_exit_K64>
 inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bool ascending)
 {
     static_assert(K == 512 || K == 1024 || K == 2048, "K must be 512, 1024, or 2048");
-    // int32_mode (raw INT32 load/store to dodge denormal-flush of small packed
-    // integers) is only threaded through the early-exit columns; the full-sort
-    // tail past the early return still uses the FP32 helpers.
-    static_assert(!int32_mode || early_exit_K64, "int32_mode is only supported together with early_exit_K64");
+    // The fused (bf16 value | u16 index) words are always moved as INT32 by
+    // load16_rows_x2 / store16_rows_x2, so small packed integers are never
+    // subject to FP32 denormal flush; no per-call mode selection is needed.
+    static_assert(
+        !early_exit_K64 || K >= 1024,
+        "early_exit_K64 requires K >= 1024: the length-64 build phase lives in the K >= 1024 block, so a K=512 "
+        "instantiation would return before it runs");
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
     bool dir                            = ascending;
     const std::uint32_t tile_offset     = dst_index << DstTileSizeLog2[DstTileShape::Tile32x32];
@@ -1490,7 +1495,7 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
         // larger but that branch isn't reached here.
         for (int i = 0; i < row_scale_factor; i++)
         {
-            load16_rows_x2<consecutive_32_offset, int32_mode>();
+            load16_rows_x2<consecutive_32_offset>();
             bitonic_sort_len_2();
             bitonic_sort_len_4(ascending);
             if (i == 0)
@@ -1509,7 +1514,7 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
                 lltt::replay(0, 32);
             }
             bitonic_sort_len_32(dir);
-            store16_rows_x2<consecutive_32_offset, 32, int32_mode>();
+            store16_rows_x2<consecutive_32_offset, 32>();
             if constexpr (row_scale_factor > 1)
             {
                 dir = !dir;
@@ -1525,13 +1530,16 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
             // trailing `TTI_INCRWC(+8)` issues PR #567's version had.
             for (int i = 0; i < (row_scale_factor >> 1); i++)
             {
-                load16_rows_x2<32, int32_mode>();
+                load16_rows_x2<32>();
                 bitonic_sort_len_k(dir);
-                store16_rows_x2<32, 16, int32_mode>();
-                load16_rows_x2<32, int32_mode>();
+                store16_rows_x2<32, 16>();
+                load16_rows_x2<32>();
                 bitonic_sort_len_k(dir);
-                store16_rows_x2<32, 48, int32_mode>();
-                if constexpr ((row_scale_factor >> 1) > 1)
+                store16_rows_x2<32, 48>();
+                // Early-exit sorts each column in isolation, so it suppresses the
+                // inter-pair flip when there is only one pair; the full sort keeps
+                // its historical unconditional flip.
+                if constexpr (!early_exit_K64 || (row_scale_factor >> 1) > 1)
                 {
                     dir = !dir;
                 }
@@ -1544,15 +1552,15 @@ inline void _topk_xl_local_sort_generic_(const std::uint32_t dst_index, const bo
             // iter 0 is recorded into slots [0..7] / [8..15] in Exec mode;
             // remaining iters replay. `dir` flips after iters 1, 3, ...
             // so pairs of iters share a direction.
-            load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<consecutive_32_offset, int32_mode>(); });
+            load_replay_buf<Exec>(0, 8, [] { load16_rows_x2<consecutive_32_offset>(); });
             bitonic_sort_len_32(dir);
-            load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<consecutive_32_offset, 32, int32_mode>(); });
+            load_replay_buf<Exec>(8, 8, [] { store16_rows_x2<consecutive_32_offset, 32>(); });
             for (int i = 1; i < row_scale_factor; i++)
             {
                 lltt::replay(0, 8);
                 bitonic_sort_len_32(dir);
                 lltt::replay(8, 8);
-                if constexpr (row_scale_factor > 2)
+                if constexpr (!early_exit_K64 || row_scale_factor > 2)
                 {
                     if ((i & 1) == 1)
                     {

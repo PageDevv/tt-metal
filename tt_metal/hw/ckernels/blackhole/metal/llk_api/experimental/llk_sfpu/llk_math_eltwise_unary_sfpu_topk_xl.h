@@ -27,15 +27,27 @@ inline void llk_math_eltwise_unary_sfpu_topk_xl_local_sort(
 // after the per-column len-64 builds (no cross-column passes, no inter-column
 // direction flip) so each column is sorted in isolation. Used by the sparse-K
 // reader to sink all-zero packed mask words to the bottom of each column.
-template <std::uint32_t K, bool APPROXIMATE, bool early_exit_K64, bool int32_mode = false>
+template <std::uint32_t K, bool APPROXIMATE, bool early_exit_K64>
 inline void llk_math_eltwise_unary_sfpu_topk_xl_local_sort_generic(
     std::uint32_t dst_index, bool ascending, VectorMode vector_mode = VectorMode::RC_custom) {
     _llk_math_eltwise_unary_sfpu_params_(
-        ckernel::sfpu::_topk_xl_local_sort_generic_<K, APPROXIMATE, early_exit_K64, int32_mode>,
+        ckernel::sfpu::_topk_xl_local_sort_generic_<K, APPROXIMATE, early_exit_K64>,
         dst_index,
         vector_mode,
         dst_index,
         ascending);
+}
+
+// Reprogram only the MOP Expander after a topk_xl copy, instead of a full
+// topk_xl_init. See ckernel_sfpu_topk_xl.h for what copy init clobbers.
+template <bool fused>
+inline void llk_math_eltwise_unary_sfpu_topk_xl_reinit_mop_after_copy() {
+    ckernel::sfpu::topk_mop_config<fused>();
+}
+
+// Restore the ADDR_MODs and MOP state the unfused rebuild needs after a copy.
+inline void llk_math_eltwise_unary_sfpu_topk_xl_reinit_unfused_rebuild_after_copy() {
+    ckernel::sfpu::topk_reinit_unfused_rebuild_after_copy();
 }
 
 template <std::uint32_t K, bool APPROXIMATE, bool fused>
