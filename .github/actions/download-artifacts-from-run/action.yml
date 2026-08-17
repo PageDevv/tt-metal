@@ -106,8 +106,11 @@ runs:
           BUILD_ARTIFACT=$(echo "$ARTIFACTS" | grep -E "TTMetal_build_any" | grep -v "_profiler_" | head -1 || true)
         fi
 
-        # Find wheel artifact
-        WHEEL_ARTIFACT=$(echo "$ARTIFACTS" | grep -E "ttnn-dist|ttnn" | head -1 || true)
+        # Find wheel artifact. Anchored: wheels are always named ttnn-dist-cp*
+        # (see wheels.yaml), and an unanchored "ttnn" also matches per-leg
+        # artifacts like "mem-report-ttnn ..." — head -1 would then hand back a
+        # non-wheel and the downstream download would fail.
+        WHEEL_ARTIFACT=$(echo "$ARTIFACTS" | grep -E "^ttnn-dist" | head -1 || true)
 
         # Find packages artifact (optional)
         PACKAGES_ARTIFACT=$(echo "$ARTIFACTS" | grep -E "packages-" | head -1 || true)
