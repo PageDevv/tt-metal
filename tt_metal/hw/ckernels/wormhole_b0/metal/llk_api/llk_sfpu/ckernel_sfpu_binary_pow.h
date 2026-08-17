@@ -31,6 +31,7 @@ namespace sfpu {
  * @return sfpi::vFloat Result of base**pow
  *
  * Special Cases:
+ * - base = 0, pow > 0: Returns 0
  * - base = 0, pow < 0: Returns NaN (undefined)
  * - base < 0, pow = integer: Returns proper signed result (negative if odd power)
  * - base < 0, pow = non-integer: Returns NaN (complex result)
@@ -119,12 +120,6 @@ sfpi_inline sfpi::vFloat _sfpu_binary_power_21f_(sfpi::vFloat base, sfpi::vFloat
         pow, sfpi::RoundMode::Nearest);  // int16 should be plenty, since large powers will approach 0/Inf
     auto pow_rounded = sfpi::convert<sfpi::vFloat>(pow_int, sfpi::RoundMode::Nearest);
 
-    // Division by 0 when base is 0 and pow is negative => set to NaN
-    v_if((absbase == 0.f) && pow < 0.f) {
-        y = std::numeric_limits<float>::quiet_NaN();  // negative powers of 0 are NaN, e.g. pow(0, -1.5)
-    }
-    v_endif;
-
     v_if(base < 0.0f) {  // negative base
         // If pow is odd integer then result is negative
         // If power is even, then result is positive
@@ -137,6 +132,15 @@ sfpi_inline sfpi::vFloat _sfpu_binary_power_21f_(sfpi::vFloat base, sfpi::vFloat
         }
         v_endif;
     }
+    v_endif;
+
+    // setexp/exexp map 0 to log2=-127, so 0**p evaluates as 2**(-127p). After the
+    // sign branch: SFPU compares -0 < 0 as true, which would otherwise replace 0**p
+    // with NaN for non-integer p. Sequential v_if (not nested) — extra live values
+    // here spill the fp32 kernel. pow == 0 keeps 1.
+    v_if((absbase == 0.f) && pow < 0.f) { y = std::numeric_limits<float>::quiet_NaN(); }
+    v_endif;
+    v_if((absbase == 0.f) && pow > 0.f) { y = 0.0f; }
     v_endif;
 
     if constexpr (!is_fp32_dest_acc_en) {
@@ -252,12 +256,6 @@ sfpi_inline sfpi::vFloat _sfpu_binary_power_f32_(sfpi::vFloat base, sfpi::vFloat
     v_if(out_exp >= 255) { y = std::numeric_limits<float>::infinity(); }
     v_endif;
 
-    // Division by 0 when base is 0 and pow is negative => set to NaN (only for negative exponents)
-    v_if(base == 0.f && pow < 0.f) {
-        y = std::numeric_limits<float>::quiet_NaN();  // negative powers of 0 are NaN, e.g. pow(0, -1.5)
-    }
-    v_endif;
-
     v_if(base < 0.0f) {  // negative base
         // Post-processing: ensure that special values (e.g. 0**0, -1**0.5, ...) are handled correctly
         // Check valid base range
@@ -275,6 +273,14 @@ sfpi_inline sfpi::vFloat _sfpu_binary_power_f32_(sfpi::vFloat base, sfpi::vFloat
         }
         v_endif;
     }
+    v_endif;
+
+    // SFPU `== 0` is bit-exact and misses -0. Late abs so the log2 abs_base can die
+    // (keeping it live spills this kernel). Sequential v_if, not nested.
+    sfpi::vFloat abs_end = sfpi::abs(base);
+    v_if(abs_end == 0.f && pow < 0.f) { y = std::numeric_limits<float>::quiet_NaN(); }
+    v_endif;
+    v_if(abs_end == 0.f && pow > 0.f) { y = 0.0f; }
     v_endif;
 
     return y;
