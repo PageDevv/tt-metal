@@ -31,6 +31,18 @@ inline void llk_unpack_AB_reduce_init(const std::uint32_t operandA, const std::u
     const ckernel::TensorShape tensor_shape = get_operand_tensor_shape(operandA_id);
 
     _llk_unpack_reduce_init_<pool_type, reduce_dim>(operandA_id, operandB_id, tensor_shape);
+
+    // Column reduce (GAPOOL) consumes MxFp4 SrcA as the 2x-packed src-register format, like matmul.
+    // Override only the unpacker gasket OUT_DATA_FORMAT to MxFp4_2x_B (shadow register; unpacker idle
+    // at init before the first UNPACR; buffer descriptor keyed on the MxFp4 L1 format is unchanged).
+    // operandA -> SrcA -> UNP_A. Only REDUCE_COL supports 2x. EN_32BIT_DEST does not affect the
+    // MxFp4->MxFp4_2x_B reconfig validity, so pass false.
+    if constexpr (reduce_dim == ReduceDim::REDUCE_COL) {
+        if (static_cast<DataFormat>(get_operand_src_format(operandA_id)) == DataFormat::MxFp4) {
+            _llk_unpack_reconfig_data_format_src_<p_unpacr::UNP_A, false>(
+                get_operand_src_format(operandA_id), static_cast<std::uint32_t>(DataFormat::MxFp4_2x_B));
+        }
+    }
 }
 
 /**
