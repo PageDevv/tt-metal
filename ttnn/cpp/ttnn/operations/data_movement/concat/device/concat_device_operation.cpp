@@ -26,7 +26,10 @@ ConcatDeviceOperation::program_factory_t ConcatDeviceOperation::select_program_f
     const auto& input_tensors = tensor_args.input_tensors;
 
     if (const bool input_is_sharded = input_tensors[0].is_sharded(); !input_is_sharded) {
-        if (can_use_tiled_unaligned_concat(input_tensors, args.dim, args.groups, args.output_mem_config)) {
+        // The launch infra allocates the output tensor before factory selection, so the
+        // allocator's free window already accounts for it.
+        if (can_use_tiled_unaligned_concat(
+                input_tensors, args.dim, args.groups, args.output_mem_config, /*output_already_allocated=*/true)) {
             return ConcatTiledUnalignedProgramFactory{};
         }
         return ConcatProgramFactory{};
@@ -119,7 +122,8 @@ void ConcatDeviceOperation::validate_on_program_cache_miss(
         }
     }
     if (warn_about_alignment &&
-        !can_use_tiled_unaligned_concat(input_tensors, args.dim, args.groups, args.output_mem_config)) {
+        !can_use_tiled_unaligned_concat(
+            input_tensors, args.dim, args.groups, args.output_mem_config, /*output_already_allocated=*/true)) {
         log_warning(
             tt::LogOp,
             "ttnn.concat: Tile padding along concatenated dim ({}) is not "
