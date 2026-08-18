@@ -37,9 +37,10 @@ void write_go_signal(
     bool send_mcast,
     bool send_unicasts,
     const program_dispatch::ProgramDispatchMetadata& dispatch_md) {
-    const auto& hal = MetalContext::instance().hal();
+    MetalContext& metal_ctx = MetalContext::instance(sysmem_manager.get_context_id());
+    const auto& hal = metal_ctx.hal();
     uint32_t pcie_alignment = hal.get_alignment(HalMemType::HOST);
-    DeviceCommandCalculator calculator;
+    DeviceCommandCalculator calculator(metal_ctx);
     if (tt_metal::MetalContext::instance().get_dispatch_query_manager().dispatch_s_enabled()) {
         calculator.add_notify_dispatch_s_go_signal_cmd();
     }
@@ -52,7 +53,7 @@ void write_go_signal(
 
     auto sub_device_index = *sub_device_id;
 
-    HugepageDeviceCommand go_signal_cmd_sequence(cmd_region, cmd_sequence_sizeB);
+    HugepageDeviceCommand go_signal_cmd_sequence(metal_ctx, cmd_region, cmd_sequence_sizeB);
 
     if (not dispatch_md.prefetcher_cache_info.is_cached) {
         go_signal_cmd_sequence.add_prefetch_set_ringbuffer_offset(
@@ -102,13 +103,14 @@ void write_go_signal(
 
 void write_rt_profiler_flush(
     uint8_t cq_id, SubDeviceId sub_device_id, SystemMemoryManager& sysmem_manager, uint32_t wait_count) {
-    DeviceCommandCalculator calculator;
+    MetalContext& metal_ctx = MetalContext::instance(sysmem_manager.get_context_id());
+    DeviceCommandCalculator calculator(metal_ctx);
     calculator.add_dispatch_rt_profiler_flush();
     uint32_t cmd_sequence_sizeB = calculator.write_offset_bytes();
 
     void* cmd_region = sysmem_manager.issue_queue_reserve(cmd_sequence_sizeB, cq_id);
 
-    HugepageDeviceCommand flush_cmd_sequence(cmd_region, cmd_sequence_sizeB);
+    HugepageDeviceCommand flush_cmd_sequence(metal_ctx, cmd_region, cmd_sequence_sizeB);
     const uint32_t wait_stream = MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(*sub_device_id);
     flush_cmd_sequence.add_dispatch_rt_profiler_flush(wait_count, wait_stream);
 
