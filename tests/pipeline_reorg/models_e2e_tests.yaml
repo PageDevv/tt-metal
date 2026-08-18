@@ -1361,75 +1361,96 @@
   team: models
 
 # ── TT-Train (Blackhole Galaxy) ───────────────────────────────────
+# Single-rank mpirun, as in the LTX legs above: the cmd body itself runs on the control
+# runner, which has neither /opt/venv nor devices. setup_pth.sh patches the worker's
+# site-packages in place, so it has to share the rank with the run that imports ttml.
 - name: Galaxy TinyLlama 1.1B DDP=32 train e2e tests
   cmd: |
-    ./tt-train/scripts/setup_pth.sh
-    python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "tinyllama_1_1b_ddp32_shakespeare"
+    mpirun -np 1 --bind-to none --tag-output --wdir "${TT_METAL_HOME}" bash -lc '
+      ./tt-train/scripts/setup_pth.sh
+      python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "tinyllama_1_1b_ddp32_shakespeare"
+    '
   model: "[tt-train] tinyllama_1_1b_ddp32"
   skus:
-    bh_galaxy:
+    bh_sc1:
       timeout: 35
       tier: 3
+      release_ready: false
   owner_id: U07K00A281X # Kevin Wu
   team: train
 
 - name: Galaxy Llama 8B TP=8 DDP=4 train e2e tests
   cmd: |
-    ./tt-train/scripts/setup_pth.sh
-    python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "llama_8b_tp8_ddp4_shakespeare"
+    mpirun -np 1 --bind-to none --tag-output --wdir "${TT_METAL_HOME}" bash -lc '
+      ./tt-train/scripts/setup_pth.sh
+      python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "llama_8b_tp8_ddp4_shakespeare"
+    '
   model: "[tt-train] llama_8b_tp8_ddp4"
   skus:
-    bh_galaxy:
+    bh_sc1:
       timeout: 20
       tier: 3
+      release_ready: false
   owner_id: U07K00A281X # Kevin Wu
   team: train
 
 - name: Galaxy Qwen 3 1.7B DDP=32 train e2e tests
   cmd: |
-    ./tt-train/scripts/setup_pth.sh
-    python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "qwen3_1_7b_ddp32_shakespeare"
+    mpirun -np 1 --bind-to none --tag-output --wdir "${TT_METAL_HOME}" bash -lc '
+      ./tt-train/scripts/setup_pth.sh
+      python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "qwen3_1_7b_ddp32_shakespeare"
+    '
   model: "[tt-train] qwen3_1_7b_ddp32_shakespeare"
   skus:
-    bh_galaxy:
+    bh_sc1:
       timeout: 15
       tier: 3
+      release_ready: false
   owner_id: U07K00A281X # Kevin Wu
   team: train
 
 - name: Galaxy Tiny Deepseek v3 DDP=32 train e2e tests
   cmd: |
-    ./tt-train/scripts/setup_pth.sh
-    python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "tiny_deepseek_v3_ddp32_char_shakespeare"
+    mpirun -np 1 --bind-to none --tag-output --wdir "${TT_METAL_HOME}" bash -lc '
+      ./tt-train/scripts/setup_pth.sh
+      python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "tiny_deepseek_v3_ddp32_char_shakespeare"
+    '
   model: "[tt-train] tiny_deepseek_v3_ddp32_char"
   skus:
-    bh_galaxy:
+    bh_sc1:
       timeout: 90
       tier: 3
+      release_ready: false
   owner_id: U07K00A281X # Kevin Wu
   team: train
 
 - name: Galaxy Llama 70B TP=8 FSDP=4 train e2e tests
   cmd: |
-    ./tt-train/scripts/setup_pth.sh
-    python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "llama_70b_tp8_fsdp4_shakespeare"
+    mpirun -np 1 --bind-to none --tag-output --wdir "${TT_METAL_HOME}" bash -lc '
+      ./tt-train/scripts/setup_pth.sh
+      python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "llama_70b_tp8_fsdp4_shakespeare"
+    '
   model: "[tt-train] llama_70b_tp8_fsdp4"
   skus:
-    bh_galaxy:
+    bh_sc1:
       timeout: 90
       tier: 3
+      release_ready: false
   owner_id: U07K00A281X # Kevin Wu
   team: train
 
 # Hanging on g13blx01, disable until issue is resolved: https://github.com/tenstorrent/tt-metal/issues/49557
 # - name: Galaxy Llama 8B TP=4 DDP=8 train e2e tests
 #   cmd: |
-#     ./tt-train/scripts/setup_pth.sh
-#     python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "llama_8b_tp4_ddp8_shakespeare"
+#     mpirun -np 1 --bind-to none --tag-output --wdir "${TT_METAL_HOME}" bash -lc '
+#       ./tt-train/scripts/setup_pth.sh
+#       python tt-train/scripts/run_models.py --model_config tt-train/scripts/run_models_configs/galaxy.yaml --filter-filenames "llama_8b_tp4_ddp8_shakespeare"
+#     '
 #   model: "[tt-train] llama_8b_tp4_ddp8"
 #   skus:
-#     bh_galaxy:
+#     bh_sc1:
 #       timeout: 25
 #       tier: 3
+#       release_ready: false
 #   owner_id: U07K00A281X # Kevin Wu
 #   team: train

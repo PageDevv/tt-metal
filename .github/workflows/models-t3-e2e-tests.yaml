@@ -62,6 +62,7 @@ on:
           - "bh_p300 (P300)"
           - "bh_quietbox_2 (BH QB2)"
           - "bh_galaxy (BH Galaxy)"
+          - "bh_sc1 (BH SC1)"
       platform:
         required: false
         type: choice
