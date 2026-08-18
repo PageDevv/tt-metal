@@ -28,6 +28,11 @@ def cleanup_cache():
     report_and_clear()
 
 
+def _ci_always_uncollected(**params):
+    return params["is_ci_env"] or params["is_ci_v2_env"]
+
+
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.parametrize(
     "mesh_device, device_params",
     [

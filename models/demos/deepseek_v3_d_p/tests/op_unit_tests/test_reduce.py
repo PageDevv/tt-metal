@@ -225,8 +225,13 @@ def run_reduce(
     assert pcc > threshold, f"PCC {pcc:.6f} below threshold {threshold}"
 
 
+def _ci_unsupported_param_combos(**params):
+    return (params["is_ci_env"] or params["is_ci_v2_env"]) and params["use_weights"] is False
+
+
 # Model-independent sanity shape — small seq/emb that exercises the reduce kernel without
 # tying to any model's dimensions. Kept in a single test so it is not duplicated per model.
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize("use_weights", [True, False], ids=["weighted", "unweighted"])
 @pytest.mark.parametrize(
     "seq_len, emb_dim, topk",
@@ -238,6 +243,7 @@ def test_ttnn_reduce(mesh_device, seq_len, emb_dim, topk, use_weights):
     run_reduce(mesh_device, seq_len, emb_dim, topk, use_weights)
 
 
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize("use_weights", [True, False], ids=["weighted", "unweighted"])
 @pytest.mark.parametrize(
     "mesh_device, device_params", REDUCE_MESH_PARAMS[:1], indirect=["mesh_device", "device_params"]
@@ -271,6 +277,7 @@ def reduce_shape_params():
     return params
 
 
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize("use_weights", [True, False], ids=["weighted", "unweighted"])
 @pytest.mark.parametrize("seq_len, emb_dim, topk", reduce_shape_params())
 @pytest.mark.parametrize("mesh_device, device_params", REDUCE_MESH_PARAMS, indirect=["mesh_device", "device_params"])

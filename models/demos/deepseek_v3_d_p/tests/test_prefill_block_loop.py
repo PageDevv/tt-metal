@@ -54,6 +54,23 @@ DSV3 = get_adapter("deepseek_v3_d_p")
 PLOT_DIR = "models/demos/deepseek_v3_d_p/tests"
 
 
+def _ci_unsupported_param_combos(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]) or os.getenv("TT_DS_PERF_WRAPPER"):
+        return False
+    if params["device_params"].get("fabric_config") != ttnn.FabricConfig.FABRIC_2D:
+        return True
+    if params["mesh_device"] != (2, 4):
+        return True
+    if params["layer_idx"] != 0:
+        return True
+    if params["gate_fallback_mode"] != GateComputeMode.DEVICE:
+        return True
+    if params["skip_reference"]:
+        return params["isl_total"] != 5120
+    return params["isl_total"] != 1024
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "gate_fallback_mode",
     [GateComputeMode.DEVICE, GateComputeMode.HOST_ALL],

@@ -10,6 +10,8 @@ combined back using TTNN combine produce the original input after host-side redu
 validating the full round-trip through TTNN dispatch and combine operations.
 """
 
+import os
+
 import pytest
 import torch
 from loguru import logger
@@ -405,6 +407,26 @@ def dispatch_combine_shape_params():
     return params
 
 
+def _ci_unsupported_param_combos(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]) or os.getenv("TT_DS_PERF_WRAPPER"):
+        return False
+    mesh = params["mesh_device"]
+    fabric = params["device_params"]["fabric_config"]
+    num_links = params["num_links"]
+    if mesh in ((8, 4), (2, 1)):
+        return False
+    if mesh == (2, 2):
+        return not (fabric == ttnn.FabricConfig.FABRIC_2D and num_links == 1)
+    if mesh == (4, 2):
+        return not (fabric == ttnn.FabricConfig.FABRIC_2D and num_links == 2)
+    return True
+
+
+def _ci_always_uncollected(**params):
+    return (params["is_ci_env"] or params["is_ci_v2_env"]) and not os.getenv("TT_DS_PERF_WRAPPER")
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "seq_len_per_chip, emb_dim, num_routed_experts, num_experts_per_tok, dispatch_buffer_capacity_factor",
     dispatch_combine_shape_params(),
@@ -510,6 +532,7 @@ def test_ttnn_dispatch_combine(
     indirect=["mesh_device", "device_params"],
 )
 @pytest.mark.parametrize("overflow_mode", ["cut_short_last", "omit_last"])
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 def test_ttnn_dispatch_combine_overflow(mesh_device, num_links, topology, overflow_mode):
     """Verify dispatch/combine does not hang when the flat dispatch buffer overflows.
 
@@ -680,6 +703,7 @@ def test_ttnn_dispatch_combine_overflow(mesh_device, num_links, topology, overfl
     [ttnn.TILE_LAYOUT, ttnn.ROW_MAJOR_LAYOUT],
     ids=["dispatched_buffer_tile", "dispatched_buffer_row_major"],
 )
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 def test_ttnn_dispatch_combine_top4(
     mesh_device, num_links, topology, dispatched_buffer_layout, is_ci_env, is_ci_v2_env
 ):

@@ -397,7 +397,12 @@ def run_model(
     logger.success(f"✓ Reference and TT comparison with {weight_type} weights successful")
 
 
+def _ci_always_uncollected(**params):
+    return (params["is_ci_env"] or params["is_ci_v2_env"]) and not os.getenv("TT_DS_PERF_WRAPPER")
+
+
 # sp x tp
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.parametrize(
     "mesh_device",
     [(32, 4), (8, 4), (2, 4)],

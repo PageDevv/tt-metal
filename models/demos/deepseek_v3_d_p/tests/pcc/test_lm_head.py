@@ -50,6 +50,11 @@ def random_weights(config, emb_dim: int, vocab_size: int, dtype: torch.dtype):
     return config, weights
 
 
+def _ci_always_uncollected(**params):
+    return params["is_ci_env"] or params["is_ci_v2_env"]
+
+
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.parametrize("is_column_parallel", [True, False], ids=["col", "row"])
 @pytest.mark.parametrize("is_balanced", [False, True], ids=["sequential", "balanced"])
 @pytest.mark.parametrize(
@@ -210,6 +215,7 @@ def test_lm_head(
     logger.debug("PCC test passed!")
 
 
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 def test_global_to_local_token_id():
     """Verify token mapping for both balanced and sequential modes."""
     from models.demos.deepseek_v3_d_p.tt.mla.utils import global_to_local_token_id

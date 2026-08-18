@@ -238,6 +238,7 @@ def run_model_device_perf_test_with_merge(
     cols = ["DEVICE FW", "DEVICE KERNEL", "DEVICE BRISC KERNEL"]
     inference_time_key = "AVG DEVICE KERNEL DURATION [ns]"
 
+    extra_env = {"TT_DS_PERF_WRAPPER": "1", **(extra_env or {})}
     saved_env = {k: os.environ.get(k) for k in (extra_env or {})}
     try:
         if extra_env:
@@ -378,6 +379,7 @@ def run_model_device_perf_test_per_op(
     cols = ["DEVICE FW", "DEVICE KERNEL", "DEVICE BRISC KERNEL"]
     inference_time_key = "AVG DEVICE KERNEL DURATION [ns]"
 
+    extra_env = {"TT_DS_PERF_WRAPPER": "1", **(extra_env or {})}
     saved_env = {k: os.environ.get(k) for k in (extra_env or {})}
     try:
         if extra_env:

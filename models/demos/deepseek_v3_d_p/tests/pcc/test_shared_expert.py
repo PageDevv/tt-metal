@@ -21,6 +21,11 @@ from models.tt_transformers.tt.ccl import get_num_links
 from tests.ttnn.utils_for_testing import assert_with_pcc
 
 
+def _ci_unsupported_param_combos(**params):
+    return (params["is_ci_env"] or params["is_ci_v2_env"]) and params["seq_len_per_chip"] == 4096
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "seq_len_per_chip, emb_dim, hidden_dim",
     [

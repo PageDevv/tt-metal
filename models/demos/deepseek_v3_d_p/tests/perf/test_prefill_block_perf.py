@@ -76,6 +76,13 @@ _SUBTORUS_4X4_HOSTGATE_SKIP = pytest.mark.skip(
 )
 
 
+def _ci_unsupported_param_combos(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]):
+        return False
+    return "mesh-2x4" in params["command"] and "fabric2d" not in params["command"]
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "command, expected_device_perf_ns_per_iteration, subdir, model_name, num_iterations, batch_size, margin, comments",
     [

@@ -489,6 +489,19 @@ def run_model(
         logger.info(f"  {key}: {profiler.get(key) * 1000:.2f} ms")
 
 
+def _ci_unsupported_param_combos(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]) or os.getenv("TT_DS_PERF_WRAPPER"):
+        return False
+    if not params["is_balanced"]:
+        return True
+    if params["device_params"].get("fabric_config") != ttnn.FabricConfig.FABRIC_2D:
+        return True
+    if params["use_pretrained"]:
+        return True
+    return params["num_iterations"] != 2
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "input_source, pcc_validation, isl_total, dispatch_buffer_capacity_factor",
     [

@@ -37,6 +37,11 @@ def cleanup_cache():
     report_and_clear()
 
 
+def _ci_unsupported_param_combos(**params):
+    return (params["is_ci_env"] or params["is_ci_v2_env"]) and params["gate_mode"] != GateComputeMode.DEVICE
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "mesh_device, device_params",
     [

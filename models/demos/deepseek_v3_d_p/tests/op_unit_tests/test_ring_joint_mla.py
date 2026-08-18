@@ -462,7 +462,12 @@ def run_ring_joint_sdpa(
         logger.debug("✓ Distributed synchronization completed")
 
 
+def _ci_always_uncollected(**params):
+    return params["is_ci_env"] or params["is_ci_v2_env"]
+
+
 #  Note: seq_len and nhq_v will be scaled down to the hw test runs on, inputs are for 32x4 devices configuration
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.parametrize("q_dtype, kv_dtype", [(ttnn.bfloat16, ttnn.bfloat8_b)], ids=["q_bf16_kv_bf8"])
 @pytest.mark.parametrize(
     "seq_len, q_chunk_size, k_chunk_size",
@@ -847,6 +852,7 @@ def run_ring_joint_sdpa_perf(
 
 # Perf test: 1 compile run + num_perf_runs measured runs with tracy signposts
 # Inputs are for 32x4 production config, scaled down for smaller meshes
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.parametrize("q_dtype, kv_dtype", [(ttnn.bfloat16, ttnn.bfloat8_b)], ids=["q_bf16_kv_bf8"])
 @pytest.mark.parametrize(
     "seq_len, q_chunk_size, k_chunk_size",

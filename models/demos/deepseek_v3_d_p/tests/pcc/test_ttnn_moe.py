@@ -589,6 +589,29 @@ def run_model(
         logger.debug(f"{key}: {profiler.get(key) * 1000:.2f} ms")
 
 
+def _ci_unsupported_ds_moe(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]) or os.getenv("TT_DS_PERF_WRAPPER"):
+        return False
+    if params["padded_percent"] != 0:
+        return True
+    if params["device_params"]["fabric_config"] != ttnn.FabricConfig.FABRIC_2D:
+        return True
+    if params["gate_fallback_mode"] != GateComputeMode.DEVICE_FP32:
+        return True
+    return not params["run_pcc_check"]
+
+
+def _ci_unsupported_kimi_moe(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]) or os.getenv("TT_DS_PERF_WRAPPER"):
+        return False
+    if params["mesh_device"] != (8, 1):
+        return True
+    if params["seq_len_per_chip"] != 3200:
+        return True
+    return not params["run_pcc_check"]
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_ds_moe)
 @pytest.mark.parametrize(
     (
         "seq_len_per_chip, emb_dim, hidden_dim, num_routed_experts, num_experts_per_tok, "
@@ -734,6 +757,7 @@ def test_ds_moe(
     )
 
 
+@pytest.mark.uncollect_if(pred=_ci_unsupported_kimi_moe)
 @pytest.mark.parametrize(
     (
         "seq_len_per_chip, emb_dim, hidden_dim, num_routed_experts, num_experts_per_tok, "

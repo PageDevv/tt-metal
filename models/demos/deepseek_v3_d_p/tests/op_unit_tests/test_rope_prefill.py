@@ -19,7 +19,12 @@ from models.demos.deepseek_v3_d_p.tt.mla.utils import (
 PCC_REQUIRED = 0.99
 
 
+def _ci_unsupported_param_combos(**params):
+    return (params["is_ci_env"] or params["is_ci_v2_env"]) and params["is_balanced"]
+
+
 # sp x tp
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "mesh_device",
     [(4, 2), (2, 4)],

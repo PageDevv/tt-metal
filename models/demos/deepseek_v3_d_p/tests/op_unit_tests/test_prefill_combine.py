@@ -10,6 +10,7 @@ PyTorch reference implementation when combining expert outputs back to token pos
 Uses torch-generated dispatch inputs to isolate the combine operation.
 """
 
+import os
 from dataclasses import dataclass
 
 import pytest
@@ -499,6 +500,23 @@ def _cross_product_conflated_cmb_test_dimensions():
 #    Or fp8 test doesn't run PCC. Or fabric 1d doesn't support both x and y rings. Such combination are either prevented during necesarry
 #    test-code cross product calculation, or are skipped in the body of the test, depending on where it was less cumbersome to implement it.
 #
+def _ci_unsupported_param_combos(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]) or os.getenv("TT_DS_PERF_WRAPPER"):
+        return False
+    if not params["run_pcc_check"]:
+        return True
+    if params["num_links"] != 2:
+        return True
+    if params["dispatched_buffer_layout"] != ttnn.TILE_LAYOUT:
+        return True
+    if params["use_fp8_output"]:
+        return True
+    if 1 in params["mesh_device"]:
+        return True
+    return False
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "mesh_device, device_params, topology, seq_len_per_chip, emb_dim, num_routed_experts, num_experts_per_tok, dispatch_buffer_capacity_factor, run_pcc_check",
     _cross_product_conflated_cmb_test_dimensions(),

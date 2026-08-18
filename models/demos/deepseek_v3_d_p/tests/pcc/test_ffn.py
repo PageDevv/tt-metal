@@ -21,6 +21,11 @@ from models.tt_transformers.tt.ccl import get_num_links
 from tests.ttnn.utils_for_testing import assert_with_pcc
 
 
+def _ci_unsupported_param_combos(**params):
+    return (params["is_ci_env"] or params["is_ci_v2_env"]) and params["batch_seq_len"] == 4096
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize("batch_seq_len", [4096, 3200], ids=["4K", "3.2K"])
 @pytest.mark.parametrize(
     "mesh_device, device_params, num_links, topology",

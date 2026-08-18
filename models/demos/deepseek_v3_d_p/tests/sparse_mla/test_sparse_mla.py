@@ -719,8 +719,13 @@ def test_sparse_mla_rotated(
     run_sparse_mla_rotated_case(variant, config_only, mesh_device, iters_isl, seq_len, ds_layer, ds_checkpoint, ds_repo)
 
 
+def _ci_always_uncollected(**params):
+    return params["is_ci_env"] or params["is_ci_v2_env"]
+
+
 # One combined parametrization instead of independent variant/mesh/sequence/format axes. BF16 retains
 # both sparsity regimes; scaled FP8 is restricted to the real-pruning sequence to avoid redundant CI work.
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.parametrize(
     "variant, mesh_device, seq_len, cache_format",
     SPARSE_ACCURACY_CASES,
@@ -766,6 +771,7 @@ def test_sparse_mla_accuracy(
 SPARSE_REUSE_CASES = [c for c in SPARSE_ANCHOR_CASES if "glm_5_2" in c.id]
 
 
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.parametrize("variant, mesh_device, seq_len", SPARSE_REUSE_CASES, indirect=["variant", "mesh_device"])
 @pytest.mark.parametrize("device_params", SPARSE_DEVICE_PARAMS, ids=SPARSE_DEVICE_IDS, indirect=True)
 @pytest.mark.skipif(not is_blackhole(), reason="DSA ops (indexer / sparse SDPA) are Blackhole-only")
@@ -821,6 +827,7 @@ def test_sparse_mla_indexer_reuse(
 
 
 # Anchor cases (per-variant prod-closest mesh, seq=4096); collected == run.
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.parametrize("variant, mesh_device, seq_len", SPARSE_ANCHOR_CASES, indirect=["variant", "mesh_device"])
 @pytest.mark.parametrize("device_params", SPARSE_DEVICE_PARAMS, ids=SPARSE_DEVICE_IDS, indirect=True)
 @pytest.mark.parametrize("n_runs", [3], ids=["x3"])

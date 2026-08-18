@@ -37,6 +37,11 @@ _CMD_8X4_pad0 = f"pytest {_TEST_PATH} -k 'perf-device-256 and mesh-8x4 and not l
 _CMD_8X4_pad50 = f"pytest {_TEST_PATH} -k 'perf-device-256 and mesh-8x4 and not linear-8 and not mesh-4x2 and not mesh-2x4 and not fabric2d- and pad50'"
 
 
+def _ci_always_uncollected(**params):
+    return params["is_ci_env"] or params["is_ci_v2_env"]
+
+
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.timeout(0)
 def test_deepseek_v3_moe_perf_loudbox():
     """

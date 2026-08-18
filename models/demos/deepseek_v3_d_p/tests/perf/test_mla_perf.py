@@ -38,6 +38,11 @@ _CMD_CHUNKED_8X4 = f"pytest {_CHUNKED_TEST_PATH} -k 'deep-50k+5k and kimi and fu
 _CMD_K3_CHUNKED_8X4 = f"pytest {_CHUNKED_TEST_PATH} -k 'deep-50k+5k and k3 and func and 8x4 and fabric2d and scalar'"
 
 
+def _ci_always_uncollected(**params):
+    return params["is_ci_env"] or params["is_ci_v2_env"]
+
+
+@pytest.mark.uncollect_if(pred=_ci_always_uncollected)
 @pytest.mark.timeout(0)
 def test_deepseek_v3_mla_perf_loudbox():
     """

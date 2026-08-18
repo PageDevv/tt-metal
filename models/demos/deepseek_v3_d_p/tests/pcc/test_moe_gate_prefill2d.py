@@ -318,6 +318,21 @@ def _validate_gate(
     merged.assert_passed("Gate prefill2d validation failed")
 
 
+def _ci_unsupported_forward_pass(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]):
+        return False
+    if params["device_params"]["fabric_config"] != ttnn.FabricConfig.FABRIC_2D:
+        return True
+    return params["gate_fallback_mode"] != GateComputeMode.DEVICE_FP32
+
+
+def _ci_unsupported_hash_gate(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]):
+        return False
+    return params["device_params"]["fabric_config"] != ttnn.FabricConfig.FABRIC_2D
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_forward_pass)
 @pytest.mark.parametrize("gate_model, gate_fallback_mode", REGULAR_GATE_CASES)
 @pytest.mark.parametrize(
     "mesh_device, device_params, num_links, topology",
@@ -471,6 +486,7 @@ HASH_GATE_MODES = [
 ]
 
 
+@pytest.mark.uncollect_if(pred=_ci_unsupported_hash_gate)
 @pytest.mark.parametrize("gate_model", ["dsv4_pro", "dsv4_flash"])
 @pytest.mark.parametrize("gate_compute_mode", HASH_GATE_MODES)
 @pytest.mark.parametrize(
