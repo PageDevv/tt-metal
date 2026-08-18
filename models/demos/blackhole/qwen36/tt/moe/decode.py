@@ -76,9 +76,19 @@ def decode_forward(
     # receivers (see gpt_oss #45943/#45052).
     if num_devices > 1:
         routing_weights = ttnn.mesh_partition(routing_weights, dim=3, cluster_axis=1)
-    nnz = None if num_devices > 1 else top_k
 
-    sparsity = ttnn.to_layout(routing_weights, ttnn.ROW_MAJOR_LAYOUT)
+    # sparse_matmul requires sparsity.logical_volume() == num_experts (one gate per expert, the
+    # sparse batch dim). Multi-user decode has routing [1,1,B,E] (B users on dim-2), so collapse
+    # the user dim to a per-expert union mask [1,1,1,E]: an expert is computed if ANY user routed
+    # to it, and each user's per-expert weight is applied later by the routing_3d multiply — so
+    # every user still sees only its own top-k contribution. B==1 max is a no-op (bit-identical).
+    if batch_size > 1:
+        sparsity_src = ttnn.max(routing_weights, dim=2, keepdim=True)  # [1,1,1,E]
+        nnz = None
+    else:
+        sparsity_src = routing_weights
+        nnz = None if num_devices > 1 else top_k
+    sparsity = ttnn.to_layout(sparsity_src, ttnn.ROW_MAJOR_LAYOUT)
     output_tile = ttnn.Tile([32, 32])
 
     # up/gate fused into ONE sparse_matmul over concatenated weights (N = 2*full_intermediate),

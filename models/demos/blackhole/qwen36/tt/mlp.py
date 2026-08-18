@@ -190,7 +190,10 @@ class Qwen36MLP:
             math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, packer_l1_acc=True
         )
 
-    def forward(self, x):
+    def forward(self, x, mode=None):
+        # mode is accepted for a uniform feed-forward signature with Qwen36MoE (which needs an
+        # explicit decode/prefill mode); the dense MLP infers its path from the input shape, so
+        # mode is unused here and the dense behavior is unchanged.
         if self.num_devices > 1:
             return self._forward_tp(x)
         w = self.weights
