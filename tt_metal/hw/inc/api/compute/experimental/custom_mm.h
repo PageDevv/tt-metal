@@ -251,7 +251,7 @@ ALWI void custom_mm_block_math(
  * | Argument              | Description                                                                            | Type     | Valid Range                  | Required              |
  * |-----------------------|----------------------------------------------------------------------------------------|----------|------------------------------|-----------------------|
  * | dense_packing         | Whether to pack consecutive tiles 32 rows apart (instead of 64, doubles dest capacity) | bool     | true/false                   | False (default false) |
- * | restore_tile_pack_mop | Reinstall the default (32x32-tile, 4-face) tile-pack MOP on exit                       | bool     | true/false                   | False (default false) |
+ * | restore_tile_pack_mop | Install the default (32x32-tile, 4-face) tile-pack MOP on exit. NOT a restore: full custom_mm_block_init derives pack geometry from out_cb_id via llk_pack_init, and custom_mm_block_init_short programs no pack MOP at all, so on a non-32x32 output CB this clobbers rather than restores, and on the init_short path there is nothing here to restore. Also leaves the set_packer_strides/SETADCXX state _llk_pack_init_ programs untouched. Body is identical to pack_block_contiguous_uninit() (experimental/pack_block_uninit.h) — prefer pairing that with pack_block_contiguous_init instead of setting this flag. | bool     | true/false                   | False (default false) |
  */
 // clang-format on
 template <bool dense_packing = false, bool restore_tile_pack_mop = false>
@@ -262,8 +262,18 @@ ALWI void custom_mm_block_uninit() {
     }
     if constexpr (restore_tile_pack_mop) {
         // Opt-in for callers following the "leave the packer at Default on op exit" convention
-        // (tt-blaze fused chains, where light follow-on ops pack without re-initing). Note this
-        // installs fixed 32x32 tile geometry — wrong for 1x32 follow-ons, which must re-init.
+        // (tt-blaze fused chains, where light follow-on ops pack without re-initing).
+        //
+        // This INSTALLS fixed 32x32/4-face geometry; it does not restore what an init programmed.
+        // Full custom_mm_block_init derives pack geometry from out_cb_id via llk_pack_init, so on a
+        // non-32x32 output CB this clobbers it — wrong for 1x32 follow-ons, which must re-init. And
+        // custom_mm_block_init_short programs no pack MOP at all, so on the mid-kernel path there is
+        // nothing here to restore. It also leaves the set_packer_strides/SETADCXX state
+        // _llk_pack_init_ programs untouched.
+        //
+        // The body is identical to pack_block_contiguous_uninit() (experimental/pack_block_uninit.h).
+        // A caller whose MOP was replaced by pack_block_contiguous_init should pair with that
+        // function rather than set this flag; the flag exists for chains that never call either.
         PACK((_llk_pack_mop_config_<PackMode::Default>()));
     }
     // Otherwise deliberately no packer-MOP write: the MOP is owned by whichever init programmed

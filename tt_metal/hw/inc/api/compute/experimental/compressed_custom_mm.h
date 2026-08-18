@@ -252,7 +252,7 @@ ALWI void compressed_custom_mm_block_math(
  * | Argument              | Description                                                                            | Type     | Valid Range                  | Required              |
  * |-----------------------|----------------------------------------------------------------------------------------|----------|------------------------------|-----------------------|
  * | dense_packing         | Whether to pack consecutive tiles 32 rows apart (instead of 64, doubles dest capacity) | bool     | true/false                   | False (default false) |
- * | restore_tile_pack_mop | Reinstall the default (32x32-tile, 4-face) tile-pack MOP on exit                       | bool     | true/false                   | False (default false) |
+ * | restore_tile_pack_mop | Install the default (32x32-tile, 4-face) tile-pack MOP on exit. NOT a restore: full custom_mm_block_init derives pack geometry from out_cb_id via llk_pack_init, and custom_mm_block_init_short programs no pack MOP at all, so on a non-32x32 output CB this clobbers rather than restores, and on the init_short path there is nothing here to restore. Also leaves the set_packer_strides/SETADCXX state _llk_pack_init_ programs untouched. Body is identical to pack_block_contiguous_uninit() (experimental/pack_block_uninit.h) — prefer pairing that with pack_block_contiguous_init instead of setting this flag. | bool     | true/false                   | False (default false) |
  */
 // clang-format on
 template <bool dense_packing = false, bool restore_tile_pack_mop = false>
@@ -262,7 +262,9 @@ ALWI void compressed_custom_mm_block_uninit() {
         PACK((cfg_reg_rmw_tensix<PCK0_ADDR_CTRL_ZW_REG_0_Wstride_RMW>(TILE_NUM_FACES * FACE_C_DIM * FACE_R_DIM * 2)));
     }
     if constexpr (restore_tile_pack_mop) {
-        // Opt-in "leave the packer at Default on op exit" convention — see custom_mm_block_uninit.
+        // Opt-in "leave the packer at Default on op exit" convention — see custom_mm_block_uninit,
+        // including why this is an install rather than a restore and when pack_block_contiguous_uninit()
+        // is the right pairing instead.
         PACK((_llk_pack_mop_config_<PackMode::Default>()));
     }
     // Otherwise deliberately no packer-MOP write — see custom_mm_block_uninit for why a no-arg
