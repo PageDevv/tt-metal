@@ -56,9 +56,8 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
 
     tt_metal::IDevice* device = &a.mutable_device();
 
-    // The width-sharded fast path binds CBs directly to the tensor's own L1 buffer (a locality
-    // optimization with no DRAM analogue), so it's gated to L1; a DRAM width-sharded tensor falls
-    // through to the generic TensorAccessor-based branch below instead.
+    // The width-sharded fast path binds CBs directly to the tensor's own L1 buffer, which has no
+    // DRAM analogue; DRAM width-sharded tensors use the generic branch below.
     bool use_width_sharding = a.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
                               output.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
                               a.memory_config().is_l1() && output.memory_config().is_l1();

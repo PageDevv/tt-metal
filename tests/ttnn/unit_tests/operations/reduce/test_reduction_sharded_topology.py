@@ -2,28 +2,9 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-# Coverage for https://github.com/tenstorrent/tt-metal/issues/43050:
-# generic reduce (sum/mean/max/min/std/var) now supports DRAM-sharded input/output for natural-axis
-# reduces (single-H, single-W, full-HW), not just L1-sharded. The fix touched:
-#   - common.cpp::build_reduce_output_tensor_spec - stop borrowing a shard grid across buffer types
-#     (DRAM shard grids are bank ids, L1 shard grids are worker-core coordinates - disjoint spaces).
-#   - common.cpp/.hpp::validate_reduce_sharded_buffer_types - accept DRAM alongside L1.
-#   - reduce_op_device_operation.cpp - the Tensix-grid-containment checks are meaningless for a DRAM
-#     bank grid, so they're gated to L1 only (DRAM's own bank-grid legality is enforced separately,
-#     in tt_metal's validate_buffer_parameters).
-#   - reduce_op_multi_core_h_program_factory.cpp - the L1-only width-sharded fast path
-#     (use_width_sharding, which binds CBs directly to the tensor's own buffer - impossible for
-#     DRAM) is gated to L1, so a DRAM WIDTH_SHARDED tensor falls through to the already-generic,
-#     TensorAccessor-based branch used by every other reduce/dim combination.
-# std/var dispatch through a separate WelfordReduceDeviceOperation, but share the same
-# validate_reduce_sharded_buffer_types (op_name="Std/Var reduction") and were already fully generic
-# (no L1-only fast path of their own).
-#
-# Explicitly out of scope (see plan): non-natural-dim/multi-axis reduce, which internally calls
-# ttnn::transpose (sum/mean/max/min) or ttnn::permute (std/var) mid-reduction - neither op's own
-# DRAM-sharded handling has been audited. And DRAM BLOCK_SHARDED, which is physically impossible for
-# any op: DRAM banks are a 1D, row-y=0 address space (tt_metal/impl/buffers/buffer.cpp), incompatible
-# with BLOCK_SHARDED's inherently 2D shard grid - confirmed below via plain tensor construction.
+# Sharded-topology coverage for generic reduce (sum/mean/max/min/std/var) on natural-axis reduces.
+# L1 and DRAM shard grids are disjoint coordinate spaces - worker-core (x,y) vs bank ids on row
+# y=0 - so buffer type is varied independently on input and output.
 
 import pytest
 
@@ -39,10 +20,10 @@ TEST_PADDING_VALUE = -42
 REDUCE_OPS = {
     "sum": (ttnn.sum, lambda t, dim, keepdim: torch.sum(t, dim=dim, keepdim=keepdim)),
     "mean": (ttnn.mean, lambda t, dim, keepdim: torch.mean(t, dim=dim, keepdim=keepdim)),
-    # amax/amin (not max/min) since they accept a tuple dim, needed for the full-HW reduce tests.
+    # amax/amin accept a tuple dim, needed by the full-HW tests.
     "max": (ttnn.max, lambda t, dim, keepdim: torch.amax(t, dim=dim, keepdim=keepdim)),
     "min": (ttnn.min, lambda t, dim, keepdim: torch.amin(t, dim=dim, keepdim=keepdim)),
-    # correction defaults to True (Bessel's correction) on both ttnn.std/var and torch.std/var.
+    # Bessel's correction defaults to True on both ttnn and torch.
     "std": (ttnn.std, lambda t, dim, keepdim: torch.std(t, dim=dim, keepdim=keepdim)),
     "var": (ttnn.var, lambda t, dim, keepdim: torch.var(t, dim=dim, keepdim=keepdim)),
 }
@@ -60,7 +41,7 @@ _L1_SHARD_CORE_GRIDS = {
     "shard_strategy", [ttnn.ShardStrategy.HEIGHT, ttnn.ShardStrategy.WIDTH, ttnn.ShardStrategy.BLOCK]
 )
 def test_reduce_l1_sharded(device, op_name, shard_strategy):
-    """L1-sharded input/output already works for generic reduce; guard against regressions."""
+    """L1-sharded input/output regression guard."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
 
@@ -103,10 +84,8 @@ def test_reduce_l1_sharded(device, op_name, shard_strategy):
 
 
 def test_reduce_dram_block_sharded_construction_is_impossible(device, expect_error):
-    """DRAM BLOCK_SHARDED can never be constructed, for any op: DRAM banks are a 1D, row-y=0
-    address space (tt_metal/impl/buffers/buffer.cpp's validate_buffer_parameters), incompatible
-    with BLOCK_SHARDED's inherently 2D shard grid. Confirmed via plain tensor construction -
-    this is not a reduce-specific gap, so there is no positive DRAM BLOCK_SHARDED case to test."""
+    """DRAM's 1D, row-y=0 bank address space cannot hold BLOCK_SHARDED's 2D shard grid, so no
+    positive DRAM BLOCK_SHARDED case exists to test - for reduce or any other op."""
     shard_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 3))})
     shard_spec = ttnn.ShardSpec(shard_grid, (32, 32), ttnn.ShardOrientation.ROW_MAJOR)
     mem_config = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.BLOCK_SHARDED, ttnn.BufferType.DRAM, shard_spec)
@@ -118,10 +97,8 @@ def test_reduce_dram_block_sharded_construction_is_impossible(device, expect_err
         )
 
 
-# (tensor_shape, shard_shape, shard_grid) satisfying each layout's physical shard-geometry
-# constraints (e.g. WIDTH_SHARDED requires shard height == full physical height) for a DRAM shard
-# grid (bank ids, single row y=0). BLOCK_SHARDED is absent: see
-# test_reduce_dram_block_sharded_construction_is_impossible above.
+# Geometries satisfying each layout's shard constraints (e.g. WIDTH_SHARDED needs shard height ==
+# full physical height) on a single-row DRAM bank grid. BLOCK_SHARDED is unconstructible on DRAM.
 _DRAM_SHARD_GEOMETRY = {
     ttnn.TensorMemoryLayout.HEIGHT_SHARDED: {
         "tensor_shape": (1, 1, 416, 32),
@@ -159,17 +136,9 @@ def _dram_sharded_input(device, shard_layout, dtype=ttnn.bfloat16, torch_input_t
 @pytest.mark.parametrize("shard_layout", list(_DRAM_SHARD_GEOMETRY.keys()))
 @pytest.mark.parametrize("dim", [-1, -2])
 def test_reduce_dram_sharded(device, op_name, shard_layout, dim):
-    """
-    DRAM-sharded input+output, covering both reduce-dim program factories, for every op:
-    - dim=-1 (W-reduce) was already fully generic (TensorAccessor-based) pre-fix, so this is mainly
-      a regression check for the buffer-type relaxation + TensorSpec-grid-construction fix.
-    - dim=-2 (H-reduce) on a WIDTH_SHARDED tensor is the one path that used to hard-fail: H-reduce's
-      L1-only fast path is now gated off for DRAM, falling through to the same generic branch.
-    Includes reducing along the tensor's own sharded dimension (e.g. WIDTH_SHARDED + dim=-1): this
-    collapses the shard count to one physical tile-of-shards, which is a pre-existing TensorSpec
-    convention (also true for L1) rather than anything this fix touches, but is included since it's
-    numerically well-defined and already covered by the geometry below.
-    """
+    """DRAM-sharded input+output across both reduce-dim program factories: dim=-1 uses the W
+    factory, dim=-2 the H factory, whose width-sharded fast path is L1-only. WIDTH_SHARDED + dim=-1
+    reduces along the tensor's own sharded dimension, collapsing it to a single shard."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
 
@@ -197,16 +166,10 @@ def test_reduce_dram_sharded(device, op_name, shard_layout, dim):
 @pytest.mark.parametrize("op_name", list(REDUCE_OPS.keys()))
 @pytest.mark.parametrize("shard_layout", list(_DRAM_SHARD_GEOMETRY.keys()))
 def test_reduce_dram_sharded_full_hw_reduce(device, op_name, shard_layout):
-    """
-    Full-HW reduce (dim=(-2,-1)) from a DRAM-sharded input to a plain DRAM-interleaved output.
-    A collapsed 1x1(-tile) result can't meaningfully stay sharded across multiple cores, so the
-    output is interleaved here (a realistic "reduce a huge sharded tensor to a scalar" request);
-    the point is exercising the real DRAM-sharded input through the multi-core-HW dispatch, which
-    for sum/mean/max/min decomposes host-side into an internal W-reduce then H-reduce
-    (reduce_op.cpp) - each internal step reads the actual sharded/intermediate tensor, so this is a
-    distinct code path from the single-axis cases in test_reduce_dram_sharded above. std/var use a
-    single unified Welford call for the HW case instead of this two-step decomposition.
-    """
+    """Full-HW reduce from a DRAM-sharded input; the output is interleaved since a collapsed 1x1
+    result cannot stay sharded across cores. sum/mean/max/min decompose host-side into a W-reduce
+    then an H-reduce, each reading the sharded or intermediate tensor; std/var use one Welford
+    call."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
 
@@ -232,10 +195,8 @@ def test_reduce_dram_sharded_full_hw_reduce(device, op_name, shard_layout):
 
 @pytest.mark.parametrize("op_name", ["sum", "max"])
 def test_reduce_dram_sharded_full_bank_width_h_reduce(device, op_name):
-    """Regression test for the device_grid.contains(shard_grid)/program_grid.contains(shard_grid)
-    checks that used to be meaningless for a DRAM bank grid (reduce_op_device_operation.cpp): a
-    WIDTH_SHARDED grid spanning every DRAM bank is wider (12 on Wormhole) than the Tensix compute
-    grid (8x8), so pre-fix this could fail even after the buffer-type relaxation alone."""
+    """A WIDTH_SHARDED grid spanning every DRAM bank is wider than the Tensix compute grid, so it
+    only passes because the grid-containment checks are gated to L1."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
 
@@ -270,9 +231,8 @@ def test_reduce_dram_sharded_full_bank_width_h_reduce(device, op_name):
 @pytest.mark.parametrize("op_name", ["sum", "max"])
 @pytest.mark.parametrize("dram_side", ["input", "output"])
 def test_reduce_h_width_sharded_mixed_l1_dram(device, op_name, dram_side):
-    """One side DRAM-WIDTH_SHARDED, the other L1-WIDTH_SHARDED, on dim=-2 (H-reduce): the
-    use_width_sharding gate must key off buffer type per-side, not just layout, so this is the
-    case most likely to catch a wrong '&&' in that condition."""
+    """One side DRAM-WIDTH_SHARDED, the other L1-WIDTH_SHARDED, on H-reduce: the use_width_sharding
+    gate must key off buffer type per side, not just layout."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
 
@@ -310,8 +270,7 @@ def test_reduce_h_width_sharded_mixed_l1_dram(device, op_name, dram_side):
 @pytest.mark.parametrize("op_name", list(REDUCE_OPS.keys()))
 @pytest.mark.parametrize("dtype", [ttnn.bfloat16, ttnn.float32, ttnn.bfloat8_b])
 def test_reduce_dram_sharded_dtypes(device, op_name, dtype):
-    """DRAM-sharded WIDTH_SHARDED + dim=-2 (the fast-path-fallback case) across every dtype
-    generic reduce claims to support, at one fixed geometry."""
+    """Every supported dtype through the H-reduce generic branch, at one fixed geometry."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
     shard_layout = ttnn.TensorMemoryLayout.WIDTH_SHARDED
@@ -328,8 +287,8 @@ def test_reduce_dram_sharded_dtypes(device, op_name, dtype):
     output_tensor = ttnn_op(dram_sharded_input, dim=-2, keepdim=True, memory_config=dram_sharded_config)
     output_tensor = ttnn.to_torch(output_tensor)
 
-    # bfloat8_b's block-float quantization pushes near-zero sums to a large relative error even
-    # though the absolute error and PCC/Frobenius norm are all comfortably within tolerance.
+    # bfloat8_b's block-float quantization inflates relative error on near-zero sums; absolute
+    # error and PCC stay well within tolerance.
     assert_numeric_metrics(
         torch_output_tensor,
         output_tensor,
@@ -341,14 +300,10 @@ def test_reduce_dram_sharded_dtypes(device, op_name, dtype):
 
 
 def test_reduce_dram_sharded_non_natural_dim(device, expect_error):
-    """Non-natural-dim reduce (dim=1, not H/W) internally calls ttnn::transpose (sum/mean/max/min)
-    or ttnn::permute (std/var) to move the reduced axis into H/W position - neither op's own
-    DRAM-sharded handling has been audited, so this is out of this fix's scope. Verified behavior
-    is currently inconsistent across ops: ttnn.sum succeeds on this exact input, but
-    mean/max/min/std/var all hit the same shard-grid-fit error while building the transposed
-    intermediate's TensorSpec. Pinned here via ttnn.mean so a future transpose/permute fix has a
-    test to flip; this is not claiming every op behaves identically today.
-    """
+    """Non-natural-dim reduce moves the axis into H/W position via transpose or permute, whose
+    DRAM-sharded handling is out of scope here. Behavior differs across ops - ttnn.sum succeeds on
+    this input while mean/max/min/std/var fail building the intermediate's TensorSpec - so only
+    ttnn.mean is pinned."""
     torch.manual_seed(0)
     shard_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))})
     shard_spec = ttnn.ShardSpec(shard_grid, (416, 32), ttnn.ShardOrientation.ROW_MAJOR)  # one shard per (n, c) slice
@@ -363,9 +318,8 @@ def test_reduce_dram_sharded_non_natural_dim(device, expect_error):
 
 
 def test_reduce_h_width_sharded_l1_and_dram_use_distinct_programs(device):
-    """L1-WIDTH_SHARDED and DRAM-WIDTH_SHARDED H-reduce must compile to different cached programs
-    (the fast path vs. the generic fallback), proving the buffer-type gate actually participates
-    in the program-cache key rather than being erased by it."""
+    """L1- and DRAM-WIDTH_SHARDED H-reduce take different branches, so the buffer type must reach
+    the program-cache key as distinct entries."""
     shard_layout = ttnn.TensorMemoryLayout.WIDTH_SHARDED
     tensor_shape = _DRAM_SHARD_GEOMETRY[shard_layout]["tensor_shape"]
     shard_shape = _DRAM_SHARD_GEOMETRY[shard_layout]["shard_shape"]
@@ -377,7 +331,7 @@ def test_reduce_h_width_sharded_l1_and_dram_use_distinct_programs(device):
     torch_input_tensor = torch.randn(tensor_shape, dtype=torch.bfloat16)
     interleaved_input = ttnn.from_torch(torch_input_tensor, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
-    # Start from a clean cache regardless of what earlier tests in this session already compiled.
+    # Ignore whatever earlier tests in this session compiled.
     device.enable_program_cache()
     device.clear_program_cache()
     l1_input = ttnn.interleaved_to_sharded(interleaved_input, l1_config)
@@ -392,10 +346,8 @@ def test_reduce_h_width_sharded_l1_and_dram_use_distinct_programs(device):
 
 
 def test_reduce_dram_sharded_requires_explicit_output_shard_spec_across_buffer_types(device, expect_error):
-    """Regression test for the build_reduce_output_tensor_spec fix: a sharded output config with no
-    shard_spec of its own may only fall back to the input's shard grid when both share a buffer
-    type. A DRAM-sharded input paired with an L1-sharded-but-spec-less output must be rejected
-    rather than silently building an invalid TensorSpec from the wrong coordinate space."""
+    """A spec-less sharded output may only borrow the input's shard grid when both share a buffer
+    type; a DRAM input with an L1 spec-less output must be rejected."""
     shard_layout = ttnn.TensorMemoryLayout.HEIGHT_SHARDED
     torch_input_tensor, dram_sharded_input = _dram_sharded_input(device, shard_layout)
     output_config_no_spec = ttnn.MemoryConfig(shard_layout, ttnn.BufferType.L1)

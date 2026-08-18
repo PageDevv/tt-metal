@@ -133,9 +133,6 @@ void ReduceDeviceOperation::validate_on_program_cache_miss(
         // reaches here is on a tilized path.
         const auto& in_shard = tensor_args.shard_spec().value();
         const auto& input_shard_grid = in_shard.grid;
-        // DRAM shard grids are bank ids, not Tensix worker coordinates, so this containment check
-        // is only meaningful for L1; DRAM's bank-grid legality is enforced separately at buffer
-        // creation time (tt_metal's validate_buffer_parameters).
         if (tensor_args.memory_config().is_l1()) {
             TT_FATAL(
                 program_grid.contains(input_shard_grid),
@@ -169,7 +166,6 @@ void ReduceDeviceOperation::validate_on_program_cache_miss(
         const uint32_t output_tile_height = out_spec.tile().get_height();
         const uint32_t output_tile_width = out_spec.tile().get_width();
 
-        // Same DRAM-vs-Tensix-grid distinction as the input-side check above.
         if (operation_attributes.output_mem_config.is_l1()) {
             TT_FATAL(
                 program_grid.contains(output_shard_grid),

@@ -211,10 +211,9 @@ tt::tt_metal::TensorSpec build_reduce_output_tensor_spec(
             if (legacy) {
                 return {legacy->grid, legacy->orientation};
             }
-            // Falling back to the input's grid is only valid when the output shares the input's
-            // buffer type: DRAM shard grids are bank ids (1D, row y=0) while L1 shard grids are
-            // worker-core (x,y) coordinates, so borrowing across buffer types would silently pair
-            // a buffer type with a grid from the wrong coordinate space.
+            // DRAM shard grids are bank ids (1D, row y=0) and L1 shard grids are worker-core
+            // (x,y) coordinates, so borrowing the input's grid across buffer types would pair a
+            // buffer type with a grid from the wrong coordinate space.
             TT_FATAL(
                 output_mem_config.buffer_type() == input_mem_config.buffer_type(),
                 "Sharded memory layout {} on an output with buffer type {} requires an explicit "
