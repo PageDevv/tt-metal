@@ -211,6 +211,11 @@ tt::tt_metal::TensorSpec build_reduce_output_tensor_spec(
             if (legacy) {
                 return {legacy->grid, legacy->orientation};
             }
+            TT_FATAL(
+                input_nd.has_value() || input_legacy.has_value(),
+                "Sharded memory layout {} requires either nd_shard_spec or shard_spec to be set "
+                "on the output memory config or the input tensor",
+                mem_layout);
             // DRAM shard grids are bank ids (1D, row y=0) and L1 shard grids are worker-core
             // (x,y) coordinates, so borrowing the input's grid across buffer types would pair a
             // buffer type with a grid from the wrong coordinate space.
@@ -224,13 +229,7 @@ tt::tt_metal::TensorSpec build_reduce_output_tensor_spec(
             if (input_nd) {
                 return {input_nd->grid, input_nd->orientation};
             }
-            if (input_legacy) {
-                return {input_legacy->grid, input_legacy->orientation};
-            }
-            TT_THROW(
-                "Sharded memory layout {} requires either nd_shard_spec or shard_spec to be set "
-                "on the output memory config or the input tensor",
-                mem_layout);
+            return {input_legacy->grid, input_legacy->orientation};
         };
         const auto& [grid, orientation] = get_grid_and_orientation();
 
@@ -323,7 +322,10 @@ bool h_reduce_negate_fits_in_l1(
     const uint32_t Ht = H / tile_height;
 
     auto* device = input_tensor.device();
-    const bool use_width_sharding = input_tensor.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED;
+    // Must mirror the H factory's gate: the shard-based CB sizing below only describes the
+    // program it actually builds when the width-sharded fast path is selected, which needs L1.
+    const bool use_width_sharding = input_tensor.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
+                                    input_tensor.memory_config().is_l1();
 
     uint32_t num_cols_per_core_group_1 = 0;
     uint32_t num_cols_per_core_group_2 = 0;

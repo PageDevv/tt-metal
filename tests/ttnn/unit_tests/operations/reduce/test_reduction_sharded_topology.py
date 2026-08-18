@@ -41,7 +41,7 @@ _L1_SHARD_CORE_GRIDS = {
     "shard_strategy", [ttnn.ShardStrategy.HEIGHT, ttnn.ShardStrategy.WIDTH, ttnn.ShardStrategy.BLOCK]
 )
 def test_reduce_l1_sharded(device, op_name, shard_strategy):
-    """L1-sharded input/output regression guard."""
+    """L1-sharded input/output on H-reduce; only the WIDTH case takes the width-sharded fast path."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
 
@@ -49,7 +49,7 @@ def test_reduce_l1_sharded(device, op_name, shard_strategy):
     core_grid = _L1_SHARD_CORE_GRIDS[shard_strategy]
 
     torch_input_tensor = torch.randn(shape, dtype=torch.bfloat16)
-    torch_output_tensor = torch_op(torch_input_tensor, dim=-1, keepdim=True)
+    torch_output_tensor = torch_op(torch_input_tensor, dim=-2, keepdim=True)
 
     sharded_config = ttnn.create_sharded_memory_config(
         shape=shape,
@@ -66,7 +66,7 @@ def test_reduce_l1_sharded(device, op_name, shard_strategy):
         memory_config=sharded_config,
     )
 
-    output_tensor = ttnn_op(input_tensor, dim=-1, keepdim=True, memory_config=sharded_config)
+    output_tensor = ttnn_op(input_tensor, dim=-2, keepdim=True, memory_config=sharded_config)
 
     output_mem_config = output_tensor.memory_config()
     assert output_mem_config.buffer_type == ttnn.BufferType.L1
@@ -354,3 +354,63 @@ def test_reduce_dram_sharded_requires_explicit_output_shard_spec_across_buffer_t
 
     with expect_error(RuntimeError, "requires an explicit shard_spec"):
         ttnn.sum(dram_sharded_input, dim=-1, keepdim=True, memory_config=output_config_no_spec)
+
+
+# Shard shape spanning C and a sub-tile width, so the layout stays ND_SHARDED instead of
+# normalizing to a legacy one.
+_DRAM_ND_TENSOR_SHAPE = (1, 4, 128, 128)
+_DRAM_ND_SHARD_SHAPE = [1, 2, 64, 64]
+
+
+def _dram_nd_sharded_config():
+    grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))})
+    return ttnn.MemoryConfig(ttnn.BufferType.DRAM, ttnn.NdShardSpec(ttnn.Shape(_DRAM_ND_SHARD_SHAPE), grid))
+
+
+@pytest.mark.parametrize("op_name", ["sum", "std"])
+@pytest.mark.parametrize("dim", [-1, -2])
+def test_reduce_dram_nd_sharded(device, op_name, dim):
+    """DRAM ND_SHARDED input and output, covering build_reduce_output_tensor_spec's ND branch."""
+    torch.manual_seed(0)
+    ttnn_op, torch_op = REDUCE_OPS[op_name]
+
+    nd_config = _dram_nd_sharded_config()
+    torch_input_tensor = torch.randn(_DRAM_ND_TENSOR_SHAPE, dtype=torch.bfloat16)
+    torch_output_tensor = torch_op(torch_input_tensor, dim, True)
+
+    input_tensor = ttnn.from_torch(
+        torch_input_tensor, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device, memory_config=nd_config
+    )
+    assert input_tensor.memory_config().memory_layout == ttnn.TensorMemoryLayout.ND_SHARDED
+
+    output_tensor = ttnn_op(input_tensor, dim=dim, keepdim=True, memory_config=nd_config)
+
+    output_mem_config = output_tensor.memory_config()
+    assert output_mem_config.buffer_type == ttnn.BufferType.DRAM
+    assert output_mem_config.is_sharded()
+
+    assert_numeric_metrics(
+        torch_output_tensor,
+        ttnn.to_torch(output_tensor),
+        pcc_threshold=0.999,
+        rtol=0.05,
+        atol=0.05,
+        frobenius_threshold=0.01,
+    )
+
+
+def test_reduce_dram_nd_sharded_requires_explicit_output_nd_shard_spec(device, expect_error):
+    """ND counterpart of the legacy-fallback guard: an L1 ND output with no nd_shard_spec of its
+    own cannot borrow a DRAM input's bank grid."""
+    torch_input_tensor = torch.randn(_DRAM_ND_TENSOR_SHAPE, dtype=torch.bfloat16)
+    input_tensor = ttnn.from_torch(
+        torch_input_tensor,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=_dram_nd_sharded_config(),
+    )
+    output_config_no_spec = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.ND_SHARDED, ttnn.BufferType.L1)
+
+    with expect_error(RuntimeError, "requires an explicit nd_shard_spec"):
+        ttnn.sum(input_tensor, dim=-2, keepdim=True, memory_config=output_config_no_spec)
