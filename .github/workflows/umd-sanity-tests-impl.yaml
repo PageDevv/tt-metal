@@ -29,7 +29,7 @@ on:
         description: "Commit SHA to test (default: HEAD)"
     outputs:
       matrix:
-        description: "Filtered test matrix, consumed by the run-level ai-summary for INFRA_FAILURE reconciliation."
+        description: "Filtered matrix of legs that ran (consumed by ai_summary/run for INFRA_FAILURE reconciliation)"
         value: ${{ jobs.load-test-matrix.outputs.matrix }}
 
 jobs:
@@ -112,7 +112,7 @@ jobs:
           log-file: generated/test_logs/${{ matrix.test-group.name }}.log
           run: ${{ matrix.test-group.cmd }}
       - name: 🤖 AI job summary
-        if: always() && !cancelled()
+        if: ${{ !cancelled() }}
         continue-on-error: true
         uses: tenstorrent/tt-github-actions/.github/actions/ai_summary/job@main
         with:

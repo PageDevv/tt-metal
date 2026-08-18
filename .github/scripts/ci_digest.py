@@ -4,7 +4,7 @@
 """CI digest: report the current state of watched workflows.
 
 Thin aggregator. For each watched workflow it finds the latest completed
-scheduled run and reads that run's machine-readable ``ai_run_summary_<run_id>``
+scheduled run and reads that run's machine-readable ``ai_run_summary_r<run>_a<attempt>``
 artifact — a factual JSON the ai_summary/run action already produces (succeeded
 / failed / infra_failure jobs). The digest does no classification of its own; it
 collects those per-run summaries and renders them at one point so a team can
@@ -61,41 +61,64 @@ def latest_run(repo: str, workflow: str, branch: str) -> dict | None:
     return runs[0] if runs else None
 
 
+def _summary_name_pattern(run_id: int) -> str:
+    """jq/regex matching this run's report artifact, new shape and legacy.
+
+    Anchored at both ends so a longer run id (``r421`` for run 42) and an
+    unrelated prefix are rejected.
+    """
+    return f"^ai_run_summary_r?{run_id}(_|$)"
+
+
 def _artifact_attempt(name: str) -> int:
     """Attempt encoded in an ``..._a<N>`` artifact name; 1 when absent.
 
-    Artifacts predating the suffix came from single-attempt runs, so treating an
-    absent suffix as attempt 1 keeps them ordered below any re-run. Run ids are
-    all digits, so a trailing ``_a<N>`` is never part of one.
+    An absent suffix means the name carries no attempt information, so every
+    legacy artifact ties at 1 and created_at/id decides between them — the same
+    resolution used before the attempt was encoded. Run ids are all digits, so a
+    trailing ``_a<N>`` is never part of one.
     """
     m = re.search(r"_a(\d+)$", name)
     return int(m.group(1)) if m else 1
 
 
-def _latest_artifact_id(listing: list[str]) -> str | None:
-    """Newest artifact id from ``name\\tcreated_at\\tid`` lines.
+def _latest_artifact_id(listing: list[str]) -> tuple[str, str] | None:
+    """``(name, id)`` of the newest artifact in ``name\\tcreated_at\\tid`` lines.
 
-    A re-run leaves one report per attempt, so the attempt encoded in the name
-    is ranked first — created_at cannot be trusted to order them, since several
-    attempts' jobs can upload concurrently. created_at then the higher id break
-    ties among same-attempt duplicates (a workflow invoked twice in one run
-    produces those). None for an empty listing.
+    The attempt encoded in the name is authoritative and ranks first; created_at
+    is incidental metadata. created_at then the higher id break ties among
+    same-attempt duplicates, which a reusable workflow invoked twice in one run
+    does produce — verified on run 32114099987, where several artifact names
+    appear two and three times.
+
+    The name is returned so the caller can address the report file exactly.
+    Lines that don't parse are skipped rather than raised: a bad line must not
+    cost the caller every other workflow's result. None when nothing parses.
     """
-    if not listing:
+    ranked = []
+    for line in listing:
+        if not line.strip():
+            continue
+        # Artifact names may contain tabs (GitHub rejects " : < > | * ? only),
+        # so only the two machine-generated trailing fields are split off.
+        parts = line.rsplit("\t", 2)
+        if len(parts) != 3 or not parts[2].isdigit():
+            print(f"Skipping malformed artifact listing line: {line!r}", file=sys.stderr)
+            continue
+        name, created_at, art_id = parts
+        ranked.append(((_artifact_attempt(name), created_at, int(art_id)), name, art_id))
+    if not ranked:
         return None
-
-    def rank(line: str) -> tuple[int, str, int]:
-        name, created_at, art_id = line.split("\t")
-        return (_artifact_attempt(name), created_at, int(art_id))
-
-    return max(listing, key=rank).split("\t")[2]
+    _, name, art_id = max(ranked, key=lambda r: r[0])
+    return name, art_id
 
 
 def fetch_run_summary(repo: str, run_id: int) -> dict | None:
-    """Download the latest attempt's ``ai_run_summary_<run_id>`` JSON.
+    """Download the latest attempt's ``ai_run_summary_r<run>_a<n>`` JSON.
 
-    Each attempt uploads its own report as ``ai_run_summary_r<run>_a<n>``, so
-    every attempt stays downloadable; the highest attempt wins. Returns None when
+    Each attempt uploads its own report, so every attempt stays downloadable and
+    the highest attempt wins. The legacy unsuffixed ``ai_run_summary_<run>`` is
+    still resolved. Returns None when
     no such artifact exists — the workflow doesn't run ai_summary/run, or the run
     predates JSON output — so the caller can fall back to the run's conclusion.
     """
@@ -108,23 +131,25 @@ def fetch_run_summary(repo: str, run_id: int) -> dict | None:
             "--jq",
             # Matches the current ai_run_summary_r<run>_a<n> shape and the
             # legacy ai_run_summary_<run> one, which carried no r or attempt.
-            f'.artifacts[] | select(.name | test("^ai_run_summary_r?{run_id}(_|$)")) | "\\(.name)\\t\\(.created_at)\\t\\(.id)"',
+            f'.artifacts[] | select(.name | test("{_summary_name_pattern(run_id)}")) | "\\(.name)\\t\\(.created_at)\\t\\(.id)"',
         ],
         capture_output=True,
         text=True,
         check=True,
     ).stdout.splitlines()
-    art_id = _latest_artifact_id(listing)
-    if art_id is None:
+    latest = _latest_artifact_id(listing)
+    if latest is None:
         return None
+    art_name, art_id = latest
     with tempfile.TemporaryDirectory() as d:
         zip_path = os.path.join(d, "artifact.zip")
         with open(zip_path, "wb") as fh:
             subprocess.run(["gh", "api", f"repos/{repo}/actions/artifacts/{art_id}/zip"], stdout=fh, check=True)
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(d)
-        # Glob: the report is named ai_run_summary_r<run>_a<n>.json.
-        matches = _glob.glob(os.path.join(d, "**", "ai_run_summary_*.json"), recursive=True)
+        # The report .json shares the artifact's name, so it can be addressed
+        # exactly; a wildcard would pick arbitrarily if the zip ever held two.
+        matches = _glob.glob(os.path.join(d, "**", f"{art_name}.json"), recursive=True)
         if not matches:
             return None  # artifact present but .md-only (run predates JSON output)
         with open(matches[0], encoding="utf-8") as fh:
@@ -399,36 +424,83 @@ class TestSummarizeRun(unittest.TestCase):
 class TestLatestArtifactId(unittest.TestCase):
     NAME = "ai_run_summary_42"
 
+    def _id(self, lines):
+        got = _latest_artifact_id(lines)
+        return got[1] if got else None
+
     def test_newest_created_at_wins(self):
         lines = [f"{self.NAME}\t2026-07-23T01:00:00Z\t100", f"{self.NAME}\t2026-07-23T02:00:00Z\t50"]
-        self.assertEqual(_latest_artifact_id(lines), "50")
+        self.assertEqual(self._id(lines), "50")
 
     def test_tie_breaks_on_higher_id(self):
         lines = [f"{self.NAME}\t2026-07-23T01:00:00Z\t100", f"{self.NAME}\t2026-07-23T01:00:00Z\t200"]
-        self.assertEqual(_latest_artifact_id(lines), "200")
+        self.assertEqual(self._id(lines), "200")
 
     def test_empty_listing_is_none(self):
         self.assertIsNone(_latest_artifact_id([]))
 
+    def test_returns_the_winning_name_for_addressing_the_report(self):
+        lines = [f"{self.NAME}_a2\t2026-07-23T01:00:00Z\t100"]
+        self.assertEqual(_latest_artifact_id(lines), (f"{self.NAME}_a2", "100"))
+
     def test_higher_attempt_wins_over_newer_created_at(self):
-        # Attempts can upload concurrently, so created_at must not outrank the
-        # attempt encoded in the name.
+        # The attempt is authoritative metadata; created_at is incidental.
         lines = [
             f"{self.NAME}_a2\t2026-07-23T01:00:00Z\t100",
             f"{self.NAME}\t2026-07-23T09:00:00Z\t900",
         ]
-        self.assertEqual(_latest_artifact_id(lines), "100")
+        self.assertEqual(self._id(lines), "100")
 
     def test_unsuffixed_name_counts_as_attempt_one(self):
         lines = [f"{self.NAME}\t2026-07-23T01:00:00Z\t100", f"{self.NAME}_a2\t2026-07-23T02:00:00Z\t200"]
-        self.assertEqual(_latest_artifact_id(lines), "200")
+        self.assertEqual(self._id(lines), "200")
 
     def test_double_digit_attempt_beats_single(self):
         lines = [
             f"{self.NAME}_a9\t2026-07-23T09:00:00Z\t900",
             f"{self.NAME}_a10\t2026-07-23T01:00:00Z\t100",
         ]
-        self.assertEqual(_latest_artifact_id(lines), "100")
+        self.assertEqual(self._id(lines), "100")
+
+    # A malformed line must cost only itself: ValueError here used to escape
+    # check_workflow's guard and abort the whole digest, so nothing was posted.
+    def test_short_line_is_skipped(self):
+        lines = ["not-a-tabbed-line", f"{self.NAME}\t2026-07-23T01:00:00Z\t100"]
+        self.assertEqual(self._id(lines), "100")
+
+    def test_blank_line_is_skipped(self):
+        self.assertEqual(self._id(["", f"{self.NAME}\t2026-07-23T01:00:00Z\t100"]), "100")
+
+    def test_non_numeric_id_is_skipped(self):
+        lines = [f"{self.NAME}\t2026-07-23T01:00:00Z\tnope", f"{self.NAME}\t2026-07-23T01:00:00Z\t100"]
+        self.assertEqual(self._id(lines), "100")
+
+    def test_only_malformed_lines_is_none(self):
+        self.assertIsNone(_latest_artifact_id(["garbage", ""]))
+
+    def test_tab_in_the_artifact_name_still_parses(self):
+        # GitHub rejects " : < > | * ? in artifact names but not tab.
+        lines = [f"ai_run_summary_42\tstray_a2\t2026-07-23T01:00:00Z\t100"]
+        self.assertEqual(self._id(lines), "100")
+
+
+class TestSummaryNamePattern(unittest.TestCase):
+    """The only reconciliation of the current and legacy artifact names."""
+
+    def _matches(self, name, run_id=42):
+        return re.search(_summary_name_pattern(run_id), name) is not None
+
+    def test_accepts_current_and_legacy_shapes(self):
+        for name in ("ai_run_summary_42", "ai_run_summary_r42", "ai_run_summary_r42_a3"):
+            self.assertTrue(self._matches(name), name)
+
+    def test_rejects_a_longer_run_id(self):
+        for name in ("ai_run_summary_r421_a1", "ai_run_summary_4200"):
+            self.assertFalse(self._matches(name), name)
+
+    def test_rejects_other_artifacts(self):
+        for name in ("ai_job_summary_r42_a1_j99", "xai_run_summary_r42_a1", "ai_run_summary_r7_a1"):
+            self.assertFalse(self._matches(name), name)
 
 
 class TestArtifactAttempt(unittest.TestCase):

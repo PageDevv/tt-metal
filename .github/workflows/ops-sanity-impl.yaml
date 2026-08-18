@@ -40,7 +40,7 @@ on:
         description: "Commit SHA to test (default: HEAD)"
     outputs:
       matrix:
-        description: "Filtered test matrix, consumed by the run-level ai-summary for INFRA_FAILURE reconciliation."
+        description: "Filtered matrix of legs that ran (consumed by ai_summary/run for INFRA_FAILURE reconciliation)"
         value: ${{ jobs.load-test-matrix.outputs.matrix }}
 
 jobs:
@@ -91,6 +91,7 @@ jobs:
         ARCH_NAME: ${{ (contains(matrix.test-group.sku, 'bh_') || contains(matrix.test-group.sku, 'blackhole')) && 'blackhole' || 'wormhole_b0' }}
         LOGURU_LEVEL: INFO
         PYTHONPATH: /work
+        TRACY_NO_INVARIANT_CHECK: 1
         TTNN_CONFIG_OVERRIDES: '{"validate_program_args": true}'
       volumes:
         - ${{ github.workspace }}/docker-job:/work
@@ -124,13 +125,11 @@ jobs:
         uses: ./docker-job/.github/actions/run-with-log
         with:
           log-file: generated/test_logs/${{ matrix.test-group.name }}.log
-          # run-with-log is a composite action, which does not inherit step-level
-          # env, so TRACY and the test command are set inside the body. The cmd
-          # goes through a quoted heredoc rather than an inline `bash -c` string
-          # so its own quoting survives and it cannot inject into the sidecar
-          # command line.
+          # Step-level env does not reach a composite action's script (see
+          # .github/actions/run-with-log/README.md), so the cmd arrives via a
+          # quoted heredoc: the shell running this body never expands it, and
+          # the delimiter must not appear in any test-group cmd.
           run: |
-            export TRACY_NO_INVARIANT_CHECK=1
             _TEST_CMD=$(cat <<'TEST_CMD_EOF'
             ${{ matrix.test-group.cmd }}
             TEST_CMD_EOF
@@ -173,7 +172,7 @@ jobs:
         with:
           prefix: "test_reports_"
       - name: 🤖 AI job summary
-        if: always() && !cancelled()
+        if: ${{ !cancelled() }}
         continue-on-error: true
         uses: tenstorrent/tt-github-actions/.github/actions/ai_summary/job@main
         with:

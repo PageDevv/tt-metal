@@ -192,6 +192,11 @@ on:
         type: string
         default: ""
         description: "Commit SHA to test (default: HEAD)"
+      publish-run-summary:
+        required: false
+        type: boolean
+        default: true
+        description: "Publish the AI run summary. A caller that invokes this workflow more than once per run must pass false on all but one invocation, or the reports collide on the artifact name."
   push:
     branches: ["main"]
   schedule:
@@ -431,14 +436,23 @@ jobs:
       ref: ${{ inputs.ref || github.sha }}
 
   # ── AI run summary ────────────────────────────────────────────────
-  # Aggregates the per-leg ai-job-summary artifacts from every sanity impl into
-  # one run-level report. expected-jobs is the union of each impl's matrix, so a
-  # leg whose runner died (no artifact) is reported as an infra failure rather
-  # than silently dropped. Impls that were skipped expose a null/empty matrix
-  # and are filtered out before aggregation.
+  # Aggregates the per-leg ai-job-summary artifacts from the sanity impls this
+  # workflow invokes (galaxy-sanity-impl is driven by galaxy-sanity.yaml and is
+  # not covered) into one run-level report. expected-jobs is the union of each
+  # impl's matrix, so a leg whose runner died is reported as an infra failure
+  # rather than silently dropped. A new impl must be added to `needs:` below or
+  # its legs are absent from that union with no error.
+  #
+  # build-artifact and the matrix jobs are in `needs:` because every impl is
+  # gated on them: when a build fails the impls are *skipped*, not failed, and
+  # without them the combined result would be `skipped` — which suppresses
+  # infra synthesis entirely and reports a broken run as if nothing was due.
   ai-run-summary:
     name: "AI Run Summary"
     needs:
+      - build-artifact
+      - resolve-docker-pull-refs
+      - generate-sku-matrix
       - ttnn-sanity-tests
       - t3000-sanity-tests
       - ops-sanity-tests
@@ -446,31 +460,50 @@ jobs:
       - ttsim-sanity-tests
       - runtime-sim-sanity-tests
       - blackhole-multi-card-fast-sanity-tests
-    if: always()
+    # A caller that invokes this workflow twice per run (sanity-tests-debug)
+    # passes false, so the two reports don't collide on the artifact name.
+    # The github.workflow arm covers this workflow's own push/schedule triggers,
+    # where the `inputs` context is empty and the default above never applies;
+    # it is the caller's workflow name for a workflow_call, so it is false there.
+    if: ${{ !cancelled() && (inputs.publish-run-summary || github.workflow == 'Sanity tests') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         timeout-minutes: 20
+        with:
+          filter: blob:none
+          sparse-checkout: .github
       - name: Aggregate child matrices and results
         id: aggregate
+        # Reporting must never fail the run: a jq error here would turn a green
+        # sanity run red.
+        continue-on-error: true
         env:
           # toJSON(needs) is one object keyed by child job name, each with
           # `result` and `outputs.matrix`; aggregating from it keeps this
           # data-driven as impls are added to or removed from the `needs` list.
           NEEDS: ${{ toJSON(needs) }}
         run: |
-          EXPECTED=$(jq -cn --argjson n "$NEEDS" '
-            [$n[] | .outputs.matrix | select(. != null and . != "") | fromjson] | add // []')
+          # Expectation and severity both come from the children that actually
+          # ran. A cancelled child keeps a successful load-test-matrix, so
+          # including it would stub its legs as INFRA_FAILURE; skipped children
+          # expose a null/empty matrix, which fromjson would throw on.
+          RAN=$(jq -cn --argjson n "$NEEDS" '
+            [$n[] | select(.result != "cancelled" and .result != "skipped")]')
+
+          EXPECTED=$(jq -cn --argjson r "$RAN" '
+            [$r[] | .outputs.matrix | select(. != null and . != "") | fromjson] | add // []')
           echo "expected-jobs=$EXPECTED" >> "$GITHUB_OUTPUT"
           echo "Merged $(echo "$EXPECTED" | jq 'length') expected legs"
 
-          # Most-severe-wins precedence: failure > cancelled > success > skipped.
-          RESULT=$(jq -rn --argjson n "$NEEDS" '
-            [$n[].result] as $r |
-            if   any($r[]; . == "failure")   then "failure"
-            elif any($r[]; . == "cancelled") then "cancelled"
-            elif any($r[]; . == "success")   then "success"
-            else                                  "skipped"
+          # Reduced over the children that ran, so one cancelled impl cannot
+          # make the whole result `cancelled` — the consumer treats that as
+          # "synthesize nothing" and every genuinely missing leg is dropped.
+          RESULT=$(jq -rn --argjson r "$RAN" '
+            [$r[].result] as $s |
+            if   ($s | length) == 0            then "skipped"
+            elif any($s[]; . == "failure")     then "failure"
+            else                                    "success"
             end')
           echo "run-result=$RESULT" >> "$GITHUB_OUTPUT"
           echo "Combined run-result: $RESULT"
@@ -490,7 +523,7 @@ jobs:
           expected-jobs: ${{ steps.aggregate.outputs.expected-jobs }}
           run-result: ${{ steps.aggregate.outputs.run-result }}
       - name: Show report
-        if: always() && steps.ai-run-summary.outputs.report-file != ''
+        if: ${{ !cancelled() && steps.ai-run-summary.outputs.report-file != '' }}
         continue-on-error: true
         shell: bash
         env:

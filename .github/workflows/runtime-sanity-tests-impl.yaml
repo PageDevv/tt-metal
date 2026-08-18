@@ -23,7 +23,7 @@ on:
         description: "Commit SHA to test (default: HEAD)"
     outputs:
       matrix:
-        description: "Filtered test matrix, consumed by the run-level ai-summary for INFRA_FAILURE reconciliation."
+        description: "Filtered matrix of legs that ran (consumed by ai_summary/run for INFRA_FAILURE reconciliation)"
         value: ${{ jobs.load-test-matrix.outputs.matrix }}
 
 jobs:
@@ -167,10 +167,8 @@ jobs:
             mkdir -p generated/test_reports
             echo "${{ matrix.test-group.cmd }}"
             ${{ matrix.test-group.cmd }}
-      # The HW and simulator steps are mutually exclusive by SKU, so they share
-      # one log filename. It deliberately carries no " (simulator)" suffix: the
-      # ai-summary step below reports under matrix.test-group.name, which must
-      # byte-match the expected-jobs matrix entry.
+      # The HW and simulator steps are mutually exclusive by SKU, so one log
+      # filename is safe for both.
       - name: ${{ matrix.test-group.name }} (simulator)
         if: ${{ startsWith(matrix.test-group.sku, 'sim_') }}
         timeout-minutes: ${{ matrix.test-group.timeout }}
@@ -205,7 +203,7 @@ jobs:
         with:
           prefix: "test_reports_"
       - name: 🤖 AI job summary
-        if: always() && !cancelled()
+        if: ${{ !cancelled() }}
         continue-on-error: true
         uses: tenstorrent/tt-github-actions/.github/actions/ai_summary/job@main
         with:

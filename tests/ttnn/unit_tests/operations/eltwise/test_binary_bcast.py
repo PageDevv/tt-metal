@@ -1658,7 +1658,7 @@ def test_binary_sharded_scalar_invalid_row_major(
         a_shape
     )
 
-    with expect_error(RuntimeError, "Optional output tensor with Row Major input is not supported") as e:
+    with expect_error(RuntimeError, "Optional output tensor with Row Major input is not supported"):
         a_tt = ttnn.from_torch(
             a_pt,
             dtype=ttnn.bfloat16,
