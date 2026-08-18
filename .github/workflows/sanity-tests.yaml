@@ -341,6 +341,7 @@ jobs:
     if: ${{ always() && !cancelled() && needs.build-artifact.result == 'success' && needs.generate-sku-matrix.outputs.sanity-skus != '' && toJSON(inputs.run-ttnn-sanity-tests) != 'false' }}
     uses: ./.github/workflows/ttnn-sanity-tests-impl.yaml
     with:
+      summary-scope: ${{ inputs.platform }}
       # HW and sim SKUs share one call; sim_* SKUs run on ubuntu-latest (no Harbor access), so this
       # uses the canonical GHCR image from build-artifact (not the Harbor-resolved ref).
       enabled-skus: ${{ needs.generate-sku-matrix.outputs.sanity-skus }}
@@ -358,6 +359,7 @@ jobs:
     secrets: inherit
     uses: ./.github/workflows/t3000-sanity-tests-impl.yaml
     with:
+      summary-scope: ${{ inputs.platform }}
       enabled-skus: "wh_llmbox_civ2"
       docker-image: ${{ needs.build-artifact.outputs.dev-docker-image }}
       build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
@@ -375,6 +377,7 @@ jobs:
     if: ${{ always() && !cancelled() && needs.resolve-docker-pull-refs.result == 'success' && needs.build-artifact.result == 'success' && (needs.generate-sku-matrix.outputs.run-wormhole == 'true' || needs.generate-sku-matrix.outputs.run-blackhole == 'true') && toJSON(inputs.run-ops-sanity-tests) != 'false' }}
     uses: ./.github/workflows/ops-sanity-impl.yaml
     with:
+      summary-scope: ${{ inputs.platform }}
       docker-image: ${{ needs.resolve-docker-pull-refs.outputs.dev-docker-image }}
       build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
       wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
@@ -391,6 +394,7 @@ jobs:
     if: ${{ always() && !cancelled() && needs.resolve-docker-pull-refs.result == 'success' && needs.build-artifact.result == 'success' && needs.generate-sku-matrix.outputs.run-blackhole == 'true' && toJSON(inputs.run-umd-sanity-tests) != 'false' }}
     uses: ./.github/workflows/umd-sanity-tests-impl.yaml
     with:
+      summary-scope: ${{ inputs.platform }}
       enabled-skus: ${{ needs.generate-sku-matrix.outputs.bh-skus }}
       docker-image: ${{ needs.resolve-docker-pull-refs.outputs.dev-docker-image }}
       build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
@@ -404,6 +408,7 @@ jobs:
     uses: ./.github/workflows/ttsim-sanity-tests-impl.yaml
     secrets: inherit
     with:
+      summary-scope: ${{ inputs.platform }}
       basic-docker-image: ${{ needs.build-artifact.outputs.basic-dev-docker-image }}
       package-artifact-name: ${{ needs.build-artifact.outputs.packages-artifact-name }}
       ref: ${{ inputs.ref || github.sha }}
@@ -414,6 +419,7 @@ jobs:
     uses: ./.github/workflows/runtime-sanity-tests-impl.yaml
     secrets: inherit
     with:
+      summary-scope: ${{ inputs.platform }}
       docker-image: ${{ needs.build-artifact.outputs.ci-test-docker-image }}
       build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
       wheel-artifact-name: ${{ needs.build-artifact.outputs.wheel-artifact-name }}
@@ -428,6 +434,7 @@ jobs:
     secrets: inherit
     uses: ./.github/workflows/blackhole-multi-card-sanity-tests-impl.yaml
     with:
+      summary-scope: ${{ inputs.platform }}
       enabled-skus: ${{ needs.generate-sku-matrix.outputs.sanity-skus }}
       docker-image: ${{ needs.build-artifact.outputs.dev-docker-image }}
       build-artifact-name: ${{ needs.build-artifact.outputs.build-artifact-name }}
@@ -516,7 +523,8 @@ jobs:
               "model": "${{ vars.AI_SUMMARY_MODEL }}",
               "workspace": "$GITHUB_WORKSPACE",
               "input_dir": "ai_job_summaries",
-              "output_dir": "ai_run_summaries"
+              "output_dir": "ai_run_summaries",
+              "scope": "${{ inputs.platform }}"
             }
           api-key: ${{ secrets.TT_CHAT_API_KEY }}
           api-url: ${{ secrets.TT_CHAT_URL }}

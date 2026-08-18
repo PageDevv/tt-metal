@@ -87,8 +87,6 @@ jobs:
       enable-llk-asserts: ${{ needs.determine-debug-flags.outputs.enable-llk-asserts == 'true' }}
       run-wormhole: ${{ inputs.run-wormhole-tests || github.event_name == 'schedule' }}
       run-blackhole: ${{ inputs.run-blackhole-tests || github.event_name == 'schedule' }}
-      # This workflow calls sanity-tests twice; one run summary per run.
-      publish-run-summary: false
       run-sim: ${{ inputs.run-ttsim-tests || github.event_name == 'schedule' }}
 
   sanity-nightly-debug-ubuntu-24:
@@ -106,6 +104,4 @@ jobs:
       enable-llk-asserts: ${{ needs.determine-debug-flags.outputs.enable-llk-asserts == 'true' }}
       run-wormhole: ${{ inputs.run-wormhole-tests || github.event_name == 'schedule' }}
       run-blackhole: ${{ inputs.run-blackhole-tests || github.event_name == 'schedule' }}
-      # This workflow calls sanity-tests twice; one run summary per run.
-      publish-run-summary: false
       run-sim: false # ttsim requires gcc-12 which is not available on Ubuntu 24.04

@@ -16,6 +16,8 @@ import argparse
 import glob as _glob
 import json
 import os
+import contextlib
+import io
 import re
 import subprocess
 import sys
@@ -62,12 +64,21 @@ def latest_run(repo: str, workflow: str, branch: str) -> dict | None:
 
 
 def _summary_name_pattern(run_id: int) -> str:
-    """jq/regex matching this run's report artifact, new shape and legacy.
+    """jq/regex matching this run's report artifact.
 
-    Anchored at both ends so a longer run id (``r421`` for run 42) and an
-    unrelated prefix are rejected.
+    Covers three shapes: legacy ``ai_run_summary_<run>``, ``ai_run_summary_r<run>_a<n>``,
+    and a scoped ``ai_run_summary_<scope>_r<run>_a<n>`` — a workflow invoked more
+    than once per run publishes one report per invocation. Anchored at both ends
+    so a longer run id (``r421`` for run 42) and an unrelated prefix are rejected.
     """
-    return f"^ai_run_summary_r?{run_id}(_|$)"
+    return f"^ai_run_summary_([a-z0-9.-]+_)?r?{run_id}(_|$)"
+
+
+def _artifact_scope(name: str, run_id: int) -> str:
+    """The scope segment in a report artifact name, or "" when unscoped."""
+    m = re.match(rf"^ai_run_summary_([a-z0-9.-]+_)?r?{run_id}(?:_|$)", name)
+    seg = (m.group(1) or "") if m else ""
+    return seg[:-1] if seg else ""
 
 
 def _artifact_attempt(name: str) -> int:
@@ -82,7 +93,7 @@ def _artifact_attempt(name: str) -> int:
     return int(m.group(1)) if m else 1
 
 
-def _latest_artifact_id(listing: list[str]) -> tuple[str, str] | None:
+def _latest_artifact_id(listing: list[str], run_id: int = 0) -> tuple[str, str] | None:
     """``(name, id)`` of the newest artifact in ``name\\tcreated_at\\tid`` lines.
 
     The attempt encoded in the name is authoritative and ranks first; created_at
@@ -96,6 +107,7 @@ def _latest_artifact_id(listing: list[str]) -> tuple[str, str] | None:
     cost the caller every other workflow's result. None when nothing parses.
     """
     ranked = []
+    scopes: set[str] = set()
     for line in listing:
         if not line.strip():
             continue
@@ -106,9 +118,18 @@ def _latest_artifact_id(listing: list[str]) -> tuple[str, str] | None:
             print(f"Skipping malformed artifact listing line: {line!r}", file=sys.stderr)
             continue
         name, created_at, art_id = parts
+        if run_id:
+            scopes.add(_artifact_scope(name, run_id))
         ranked.append(((_artifact_attempt(name), created_at, int(art_id)), name, art_id))
     if not ranked:
         return None
+    if len(scopes) > 1:
+        # One report per invocation; ranking cannot say which invocation the
+        # digest wants, so name them rather than pick silently.
+        print(
+            f"Run has reports for scopes {sorted(scopes)}; digesting only one of them",
+            file=sys.stderr,
+        )
     _, name, art_id = max(ranked, key=lambda r: r[0])
     return name, art_id
 
@@ -137,7 +158,7 @@ def fetch_run_summary(repo: str, run_id: int) -> dict | None:
         text=True,
         check=True,
     ).stdout.splitlines()
-    latest = _latest_artifact_id(listing)
+    latest = _latest_artifact_id(listing, run_id)
     if latest is None:
         return None
     art_name, art_id = latest
@@ -501,6 +522,40 @@ class TestSummaryNamePattern(unittest.TestCase):
     def test_rejects_other_artifacts(self):
         for name in ("ai_job_summary_r42_a1_j99", "xai_run_summary_r42_a1", "ai_run_summary_r7_a1"):
             self.assertFalse(self._matches(name), name)
+
+    def test_accepts_a_scoped_report(self):
+        # A workflow invoked twice per run publishes one report per invocation.
+        for name in ("ai_run_summary_ubuntu-22-04_r42_a3", "ai_run_summary_ubuntu-24-04_r42_a1"):
+            self.assertTrue(self._matches(name), name)
+
+    def test_scope_segment_is_recoverable(self):
+        self.assertEqual(_artifact_scope("ai_run_summary_ubuntu-24-04_r42_a1", 42), "ubuntu-24-04")
+
+    def test_unscoped_names_have_no_scope(self):
+        for name in ("ai_run_summary_42", "ai_run_summary_r42", "ai_run_summary_r42_a3"):
+            self.assertEqual(_artifact_scope(name, 42), "", name)
+
+
+class TestScopedArtifactSelection(unittest.TestCase):
+    def test_two_scopes_are_named_rather_than_silently_narrowed(self):
+        lines = [
+            "ai_run_summary_ubuntu-22-04_r42_a1\t2026-07-23T01:00:00Z\t100",
+            "ai_run_summary_ubuntu-24-04_r42_a1\t2026-07-23T02:00:00Z\t200",
+        ]
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            got = _latest_artifact_id(lines, 42)
+        self.assertIsNotNone(got)
+        self.assertIn("ubuntu-22-04", buf.getvalue())
+        self.assertIn("ubuntu-24-04", buf.getvalue())
+
+    def test_single_scope_is_quiet(self):
+        lines = ["ai_run_summary_ubuntu-24-04_r42_a1\t2026-07-23T02:00:00Z\t200"]
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            got = _latest_artifact_id(lines, 42)
+        self.assertEqual(got[1], "200")
+        self.assertNotIn("scopes", buf.getvalue())
 
 
 class TestArtifactAttempt(unittest.TestCase):
