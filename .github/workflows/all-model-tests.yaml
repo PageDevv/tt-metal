@@ -545,7 +545,7 @@ jobs:
 
       - id: ai-run-summary
         continue-on-error: true
-        uses: tenstorrent/tt-github-actions/.github/actions/ai_summary/run@main
+        uses: tenstorrent/tt-github-actions/.github/actions/ai_summary/run@ppetrovic/sanity
         with:
           config: |
             {
