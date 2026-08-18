@@ -57,10 +57,6 @@ PLOT_DIR = "models/demos/deepseek_v3_d_p/tests"
 def _ci_unsupported_param_combos(**params):
     if not (params["is_ci_env"] or params["is_ci_v2_env"]) or os.getenv("TT_DS_PERF_WRAPPER"):
         return False
-    if params["device_params"].get("fabric_config") != ttnn.FabricConfig.FABRIC_2D:
-        return True
-    if params["mesh_device"] != (2, 4):
-        return True
     if params["layer_idx"] != 0:
         return True
     if params["gate_fallback_mode"] != GateComputeMode.DEVICE:

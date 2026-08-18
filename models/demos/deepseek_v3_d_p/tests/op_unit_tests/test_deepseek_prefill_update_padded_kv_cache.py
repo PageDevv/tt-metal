@@ -63,6 +63,29 @@ def _make_input(torch_chunk, dtype, layout, mesh_device, mesh_mapper):
     )
 
 
+_CI_NUM_DEVICES = None
+
+
+def _ci_mesh_for_this_machine():
+    global _CI_NUM_DEVICES
+    if _CI_NUM_DEVICES is None:
+        _CI_NUM_DEVICES = ttnn.get_num_devices()
+    if _CI_NUM_DEVICES >= 32:
+        return (8, 4)
+    if _CI_NUM_DEVICES >= 8:
+        return (2, 4)
+    if _CI_NUM_DEVICES == 4:
+        return (2, 2)
+    return (1, 1)
+
+
+def _ci_unsupported_param_combos(**params):
+    if not (params["is_ci_env"] or params["is_ci_v2_env"]):
+        return False
+    return params["mesh_device"] != _ci_mesh_for_this_machine()
+
+
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize("mesh_device", [(1, 1)], ids=["1x1"], indirect=True)
 @pytest.mark.timeout(0)
 def test_update_padded_kv_cache_scaled_fp8_packed_row(mesh_device):
@@ -117,6 +140,7 @@ def test_update_padded_kv_cache_scaled_fp8_packed_row(mesh_device):
     assert torch.count_nonzero(result[1, 0, chunk_tokens:].float()) == 0
 
 
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize("mesh_device", [(1, 1)], ids=["1x1"], indirect=True)
 @pytest.mark.parametrize("dtype, layout", DTYPE_LAYOUT_CASES, ids=DTYPE_LAYOUT_IDS)
 @pytest.mark.timeout(0)
@@ -252,6 +276,7 @@ def _update_kv(
     ttnn.deallocate(kv_t)
 
 
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize("mesh_device", [(1, 4), (2, 4), (8, 4)], ids=["1x4", "2x4", "8x4"], indirect=True)
 @pytest.mark.parametrize("dtype, layout", DTYPE_LAYOUT_CASES, ids=DTYPE_LAYOUT_IDS)
 @pytest.mark.parametrize(
@@ -413,6 +438,7 @@ def _rotated_chip_positions(kv_actual, sp, chunk_local):
     return positions
 
 
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize("mesh_device", [(2, 2), (2, 4), (8, 4)], ids=["2x2", "2x4", "8x4"], indirect=True)
 @pytest.mark.parametrize("dtype, layout", DTYPE_LAYOUT_CASES, ids=DTYPE_LAYOUT_IDS)
 @pytest.mark.parametrize(
@@ -600,6 +626,7 @@ def test_update_padded_kv_cache_multi_iteration_prefill(
     logger.info(f"program cache entries: {mesh_device.num_program_cache_entries()}")
 
 
+@pytest.mark.uncollect_if(pred=_ci_unsupported_param_combos)
 @pytest.mark.parametrize(
     "mesh_device, device_params",
     [
