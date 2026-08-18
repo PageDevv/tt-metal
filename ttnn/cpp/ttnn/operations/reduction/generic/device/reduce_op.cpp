@@ -277,7 +277,7 @@ Tensor reduce(
             /*row_major_h_dense_path=*/false,
             /*use_sfpu_reduce=*/use_sfpu_fp32_reduce);
 
-        if (negate && !ttnn::prim::h_reduce_negate_fits_in_l1(output_tensor, sub_core_grids)) {
+        if (negate && !ttnn::prim::h_reduce_negate_fits_in_l1(output_tensor, output_mem_config, sub_core_grids)) {
             return h_reduce_with_external_negate(output_tensor, reduce_scaler, post_mul, out_final_dtype);
         }
 
@@ -298,7 +298,7 @@ Tensor reduce(
     }
 
     if (negate && reduce_dim == tt::tt_metal::ReduceOpDim::H &&
-        !ttnn::prim::h_reduce_negate_fits_in_l1(prepared_input, sub_core_grids)) {
+        !ttnn::prim::h_reduce_negate_fits_in_l1(prepared_input, output_mem_config, sub_core_grids)) {
         return h_reduce_with_external_negate(
             prepared_input, reduce_scaler, post_mul, output_dtype.value_or(input_tensor.dtype()));
     }

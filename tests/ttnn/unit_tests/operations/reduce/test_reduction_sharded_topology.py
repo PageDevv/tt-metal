@@ -40,8 +40,10 @@ _L1_SHARD_CORE_GRIDS = {
 @pytest.mark.parametrize(
     "shard_strategy", [ttnn.ShardStrategy.HEIGHT, ttnn.ShardStrategy.WIDTH, ttnn.ShardStrategy.BLOCK]
 )
-def test_reduce_l1_sharded(device, op_name, shard_strategy):
-    """L1-sharded input/output on H-reduce; only the WIDTH case takes the width-sharded fast path."""
+@pytest.mark.parametrize("dim", [-1, -2])
+def test_reduce_l1_sharded(device, op_name, shard_strategy, dim):
+    """L1-sharded input/output through both factories; WIDTH + dim=-2 takes the width-sharded
+    fast path, the only combination that does."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
 
@@ -49,7 +51,7 @@ def test_reduce_l1_sharded(device, op_name, shard_strategy):
     core_grid = _L1_SHARD_CORE_GRIDS[shard_strategy]
 
     torch_input_tensor = torch.randn(shape, dtype=torch.bfloat16)
-    torch_output_tensor = torch_op(torch_input_tensor, dim=-2, keepdim=True)
+    torch_output_tensor = torch_op(torch_input_tensor, dim=dim, keepdim=True)
 
     sharded_config = ttnn.create_sharded_memory_config(
         shape=shape,
@@ -66,7 +68,7 @@ def test_reduce_l1_sharded(device, op_name, shard_strategy):
         memory_config=sharded_config,
     )
 
-    output_tensor = ttnn_op(input_tensor, dim=-2, keepdim=True, memory_config=sharded_config)
+    output_tensor = ttnn_op(input_tensor, dim=dim, keepdim=True, memory_config=sharded_config)
 
     output_mem_config = output_tensor.memory_config()
     assert output_mem_config.buffer_type == ttnn.BufferType.L1
@@ -195,8 +197,9 @@ def test_reduce_dram_sharded_full_hw_reduce(device, op_name, shard_layout):
 
 @pytest.mark.parametrize("op_name", ["sum", "max"])
 def test_reduce_dram_sharded_full_bank_width_h_reduce(device, op_name):
-    """A WIDTH_SHARDED grid spanning every DRAM bank is wider than the Tensix compute grid, so it
-    only passes because the grid-containment checks are gated to L1."""
+    """A WIDTH_SHARDED grid spanning every DRAM bank. Wormhole's 12 banks exceed the Tensix grid
+    width, so this only passes with the grid-containment checks gated to L1; Blackhole's 8 banks
+    fit inside its wider grid, where the gating is a semantic fix rather than a load-bearing one."""
     torch.manual_seed(0)
     ttnn_op, torch_op = REDUCE_OPS[op_name]
 
@@ -356,8 +359,8 @@ def test_reduce_dram_sharded_requires_explicit_output_shard_spec_across_buffer_t
         ttnn.sum(dram_sharded_input, dim=-1, keepdim=True, memory_config=output_config_no_spec)
 
 
-# Shard shape spanning C and a sub-tile width, so the layout stays ND_SHARDED instead of
-# normalizing to a legacy one.
+# Sharding C as well as H and W keeps the layout ND_SHARDED: no legacy layout can express a
+# split along C, so it cannot normalize to WIDTH/HEIGHT/BLOCK.
 _DRAM_ND_TENSOR_SHAPE = (1, 4, 128, 128)
 _DRAM_ND_SHARD_SHAPE = [1, 2, 64, 64]
 

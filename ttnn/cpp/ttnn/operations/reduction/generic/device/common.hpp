@@ -165,8 +165,12 @@ tt::tt_metal::ReduceOpParallelizationStrategy get_parallelization_strategy(
 // and c_5 (ineg) are each sized at Ht * lcm(Wt_per_core_g1, Wt_per_core_g2)
 // tiles.  For wide reductions this can exceed L1, in which case callers must
 // fall back to external negation around a non-fused (regular) reduce.
+// `output_mem_config` is needed because the per-core tile count depends on whether the H factory
+// selects its width-sharded fast path, which keys off both sides of the reduce.
 bool h_reduce_negate_fits_in_l1(
-    const ttnn::Tensor& input_tensor, const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids);
+    const ttnn::Tensor& input_tensor,
+    const tt::tt_metal::MemoryConfig& output_mem_config,
+    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids);
 
 // Builds a tt::tt_metal::TensorSpec for a reduction-style op output, given the already
 // shape-adjusted output shape and the dimension that was reduced.

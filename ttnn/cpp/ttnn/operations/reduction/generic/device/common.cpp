@@ -305,7 +305,9 @@ void validate_reduce_sharded_buffer_types(
 }
 
 bool h_reduce_negate_fits_in_l1(
-    const ttnn::Tensor& input_tensor, const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids) {
+    const ttnn::Tensor& input_tensor,
+    const tt::tt_metal::MemoryConfig& output_mem_config,
+    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids) {
     using namespace tt::tt_metal;
 
     const auto& shape = input_tensor.padded_shape();
@@ -322,10 +324,12 @@ bool h_reduce_negate_fits_in_l1(
     const uint32_t Ht = H / tile_height;
 
     auto* device = input_tensor.device();
-    // Must mirror the H factory's gate: the shard-based CB sizing below only describes the
-    // program it actually builds when the width-sharded fast path is selected, which needs L1.
+    // Must mirror the H factory's gate exactly: the shard-based CB sizing below only describes
+    // the program it actually builds when the width-sharded fast path is selected, which needs
+    // WIDTH_SHARDED L1 on both sides.
     const bool use_width_sharding = input_tensor.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
-                                    input_tensor.memory_config().is_l1();
+                                    output_mem_config.memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
+                                    input_tensor.memory_config().is_l1() && output_mem_config.is_l1();
 
     uint32_t num_cols_per_core_group_1 = 0;
     uint32_t num_cols_per_core_group_2 = 0;
