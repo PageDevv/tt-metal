@@ -24,7 +24,7 @@ namespace ckernel {
 template <EltwiseBinaryType eltwise_binary_type = EltwiseBinaryType::ELWADD, uint32_t num_tiles>
 ALWI void rmsnorm_bcast_scalar_reuse_tiles_init(uint32_t icb0) {
     UNPACK((llk_unpack_A_rmsnorm_init<num_tiles, BroadcastType::SCALAR, true, EltwiseBinaryReuseDestType::DEST_TO_SRCB>(
-        false, false, icb0)));
+        false /*transpose_of_faces*/, false /*within_face_16x16_transpose*/, icb0)));
     MATH((llk_math_rmsnorm_bcast_scalar_dest_reuse_init_with_operands<eltwise_binary_type, num_tiles, MATH_FIDELITY>(
         icb0, icb0, false /*acc_to_dest*/)));
 }
