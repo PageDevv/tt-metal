@@ -23,11 +23,7 @@ template <
     bool acc_to_dest                             = false,
     EltwiseBinaryReuseDestType binary_reuse_dest = EltwiseBinaryReuseDestType::NONE,
     bool unpack_to_dest                          = false>
-inline void _llk_unpack_A_rmsnorm_mop_config_(
-    const bool transpose_of_faces,
-    const std::uint32_t num_faces,
-    [[maybe_unused]] const std::uint32_t unpack_src_format,
-    [[maybe_unused]] const std::uint32_t unpack_dst_format = 0)
+inline void _llk_unpack_A_rmsnorm_mop_config_(const bool transpose_of_faces, const std::uint32_t num_faces)
 {
     static_assert(
         ((BType == BroadcastType::SCALAR) && acc_to_dest && (binary_reuse_dest == EltwiseBinaryReuseDestType::DEST_TO_SRCB)), "Not supported configuration!");
@@ -96,9 +92,7 @@ inline void _llk_unpack_A_rmsnorm_init_(
     const std::uint32_t transpose_of_faces          = 0,
     const std::uint32_t within_face_16x16_transpose = 0,
     const std::uint32_t face_r_dim                  = FACE_R_DIM,
-    const std::uint32_t num_faces                   = 4,
-    const std::uint32_t unpack_src_format           = 0,
-    const std::uint32_t unpack_dst_format           = 0)
+    const std::uint32_t num_faces                   = 4)
 {
     LLK_ASSERT(num_faces == 1 || num_faces == 2 || num_faces == 4, "num_faces must be 1, 2, or 4");
 
@@ -106,6 +100,8 @@ inline void _llk_unpack_A_rmsnorm_init_(
     cfg_reg_rmw_tensix<THCON_SEC0_REG2_Haloize_mode_RMW>(within_face_16x16_transpose);
 
     // TODO NC: Find out why we need to disable src zero flags for uint16 dst format #960
+    // Reviving this needs the unpack dst format plumbed back in -- it is not a parameter
+    // here, because this MOP is pinned to one configuration and never consumed it:
     // bool disable_src_zero_flag_val = disable_src_zero_flag || (static_cast<uint>(unpack_dst_format) ==
     // static_cast<uint>(DataFormat::UInt16));
     // cfg_reg_rmw_tensix<ALU_ACC_CTRL_Zero_Flag_disabled_src_RMW>(disable_src_zero_flag_val ? 1 : 0);
@@ -113,6 +109,5 @@ inline void _llk_unpack_A_rmsnorm_init_(
     constexpr std::uint32_t UNP_SEL = (BType == BroadcastType::NONE) ? p_setadc::UNP_A : p_setadc::UNP_B;
     config_unpacker_x_end<UNP_SEL>(face_r_dim);
 
-    _llk_unpack_A_rmsnorm_mop_config_<num_tiles, BType, acc_to_dest, binary_reuse_dest, unpack_to_dest>(
-        transpose_of_faces > 0, num_faces, unpack_src_format, unpack_dst_format);
+    _llk_unpack_A_rmsnorm_mop_config_<num_tiles, BType, acc_to_dest, binary_reuse_dest, unpack_to_dest>(transpose_of_faces > 0, num_faces);
 }
