@@ -16,6 +16,7 @@ import argparse
 import glob as _glob
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -60,24 +61,44 @@ def latest_run(repo: str, workflow: str, branch: str) -> dict | None:
     return runs[0] if runs else None
 
 
+def _artifact_attempt(name: str) -> int:
+    """Attempt encoded in an ``..._a<N>`` artifact name; 1 when absent.
+
+    Artifacts predating the suffix came from single-attempt runs, so treating an
+    absent suffix as attempt 1 keeps them ordered below any re-run. Run ids are
+    all digits, so a trailing ``_a<N>`` is never part of one.
+    """
+    m = re.search(r"_a(\d+)$", name)
+    return int(m.group(1)) if m else 1
+
+
 def _latest_artifact_id(listing: list[str]) -> str | None:
-    """Newest artifact id from ``created_at\\tid`` lines — RFC3339-Z sorts
-    lexically, ties break on the higher id. None for an empty listing."""
+    """Newest artifact id from ``name\\tcreated_at\\tid`` lines.
+
+    A re-run leaves one report per attempt, so the attempt encoded in the name
+    is ranked first — created_at cannot be trusted to order them, since several
+    attempts' jobs can upload concurrently. created_at then the higher id break
+    ties among same-attempt duplicates (a workflow invoked twice in one run
+    produces those). None for an empty listing.
+    """
     if not listing:
         return None
-    return max(listing, key=lambda ln: (ln.split("\t")[0], int(ln.split("\t")[1]))).split("\t")[1]
+
+    def rank(line: str) -> tuple[int, str, int]:
+        name, created_at, art_id = line.split("\t")
+        return (_artifact_attempt(name), created_at, int(art_id))
+
+    return max(listing, key=rank).split("\t")[2]
 
 
 def fetch_run_summary(repo: str, run_id: int) -> dict | None:
     """Download the latest attempt's ``ai_run_summary_<run_id>`` JSON.
 
-    Re-runs upload multiple artifacts under this one name; pick the newest by
-    created_at, since a name-only download has no defined order among duplicates.
-    Returns None when no such artifact exists — the workflow doesn't run
-    ai_summary/run, or the run predates JSON output — so the caller can fall back
-    to the run's conclusion.
+    Each attempt uploads its own report as ``ai_run_summary_r<run>_a<n>``, so
+    every attempt stays downloadable; the highest attempt wins. Returns None when
+    no such artifact exists — the workflow doesn't run ai_summary/run, or the run
+    predates JSON output — so the caller can fall back to the run's conclusion.
     """
-    name = f"ai_run_summary_{run_id}"
     listing = subprocess.run(
         [
             "gh",
@@ -85,7 +106,9 @@ def fetch_run_summary(repo: str, run_id: int) -> dict | None:
             "--paginate",
             f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100",
             "--jq",
-            f'.artifacts[] | select(.name == "{name}") | "\\(.created_at)\\t\\(.id)"',
+            # Matches the current ai_run_summary_r<run>_a<n> shape and the
+            # legacy ai_run_summary_<run> one, which carried no r or attempt.
+            f'.artifacts[] | select(.name | test("^ai_run_summary_r?{run_id}(_|$)")) | "\\(.name)\\t\\(.created_at)\\t\\(.id)"',
         ],
         capture_output=True,
         text=True,
@@ -100,7 +123,8 @@ def fetch_run_summary(repo: str, run_id: int) -> dict | None:
             subprocess.run(["gh", "api", f"repos/{repo}/actions/artifacts/{art_id}/zip"], stdout=fh, check=True)
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(d)
-        matches = _glob.glob(os.path.join(d, "**", f"{name}.json"), recursive=True)
+        # Glob: the report is named ai_run_summary_r<run>_a<n>.json.
+        matches = _glob.glob(os.path.join(d, "**", "ai_run_summary_*.json"), recursive=True)
         if not matches:
             return None  # artifact present but .md-only (run predates JSON output)
         with open(matches[0], encoding="utf-8") as fh:
@@ -373,16 +397,50 @@ class TestSummarizeRun(unittest.TestCase):
 
 
 class TestLatestArtifactId(unittest.TestCase):
+    NAME = "ai_run_summary_42"
+
     def test_newest_created_at_wins(self):
-        lines = ["2026-07-23T01:00:00Z\t100", "2026-07-23T02:00:00Z\t50"]
+        lines = [f"{self.NAME}\t2026-07-23T01:00:00Z\t100", f"{self.NAME}\t2026-07-23T02:00:00Z\t50"]
         self.assertEqual(_latest_artifact_id(lines), "50")
 
     def test_tie_breaks_on_higher_id(self):
-        lines = ["2026-07-23T01:00:00Z\t100", "2026-07-23T01:00:00Z\t200"]
+        lines = [f"{self.NAME}\t2026-07-23T01:00:00Z\t100", f"{self.NAME}\t2026-07-23T01:00:00Z\t200"]
         self.assertEqual(_latest_artifact_id(lines), "200")
 
     def test_empty_listing_is_none(self):
         self.assertIsNone(_latest_artifact_id([]))
+
+    def test_higher_attempt_wins_over_newer_created_at(self):
+        # Attempts can upload concurrently, so created_at must not outrank the
+        # attempt encoded in the name.
+        lines = [
+            f"{self.NAME}_a2\t2026-07-23T01:00:00Z\t100",
+            f"{self.NAME}\t2026-07-23T09:00:00Z\t900",
+        ]
+        self.assertEqual(_latest_artifact_id(lines), "100")
+
+    def test_unsuffixed_name_counts_as_attempt_one(self):
+        lines = [f"{self.NAME}\t2026-07-23T01:00:00Z\t100", f"{self.NAME}_a2\t2026-07-23T02:00:00Z\t200"]
+        self.assertEqual(_latest_artifact_id(lines), "200")
+
+    def test_double_digit_attempt_beats_single(self):
+        lines = [
+            f"{self.NAME}_a9\t2026-07-23T09:00:00Z\t900",
+            f"{self.NAME}_a10\t2026-07-23T01:00:00Z\t100",
+        ]
+        self.assertEqual(_latest_artifact_id(lines), "100")
+
+
+class TestArtifactAttempt(unittest.TestCase):
+    def test_unsuffixed_is_attempt_one(self):
+        self.assertEqual(_artifact_attempt("ai_run_summary_r42"), 1)
+
+    def test_suffix_parsed(self):
+        self.assertEqual(_artifact_attempt("ai_run_summary_r42_a3"), 3)
+
+    def test_only_trailing_suffix_counts(self):
+        # A run id that merely contains _a<digits> must not be read as an attempt.
+        self.assertEqual(_artifact_attempt("ai_run_summary_r1_a2_9"), 1)
 
 
 class TestRender(unittest.TestCase):
