@@ -1,0 +1,262 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+// Row-parallel compute, return_values variant: identical to compute.cpp up to
+// the final materialization, then ALSO materializes and packs the FP32 value
+// region as BFLOAT16 (values sit in DST beside the indices already — the
+// unfused merge keeps [values, indices] regions; emitting values costs one
+// extra in-DST transpose pass and one extra pack_untilize per row).
+//
+// Kept as a separate source (not an #ifdef in compute.cpp) so the default
+// indices-only program's kernel binary stays byte-identical.
+//
+// Pack ordering per row: the values pack and the indices pack target CBs with
+// different formats (Float16_b vs Float32) and face geometry, so
+// pack_untilize_dest_init is re-run per pack (init derives format/geometry
+// from the output CB; back-to-back inits are the supported reconfig path).
+// The fp32->bf16 conversion in the packer is exact for the bf16-origin value
+// words, and maps the 0xFF800000 (-inf) sentinel-lane values to bf16 -inf.
+
+#include <cstdint>
+#include "api/compute/compute_kernel_api.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/compute/pack_untilize.h"
+#include "api/compute/experimental/topk_xl.h"
+#include "api/compute/transpose_dest.h"
+#include "api/dataflow/circular_buffer.h"
+
+#include "topk_large_indices_compute_common.hpp"
+#include "topk_large_indices_chunk_skip.hpp"
+
+// Data-dependent chunk-skip early-out (row-parallel path only; see
+// topk_large_indices_chunk_skip.hpp for design + soundness proof). One-line
+// A/B toggle; keep in lockstep with compute.cpp's kChunkSkipEnable.
+constexpr bool kChunkSkipEnable = true;
+
+namespace {
+
+// Copy-only half of topk_large_indices::process_chunk (kept local: the shared
+// common header also feeds the column-parallel tree kernels, which must stay
+// untouched by chunk-skip work).
+template <uint32_t K>
+FORCE_INLINE void copy_chunk_only(CircularBuffer& input_cb, uint32_t dst_base, uint32_t active_elements) {
+    constexpr uint32_t tiles = (K + topk_large_indices::elements_per_tile - 1) / topk_large_indices::elements_per_tile;
+    const uint32_t input_cb_id = input_cb.get_cb_id();
+    input_cb.wait_front(tiles);
+    topk_xl_copy_tile_init(input_cb_id);
+    topk_xl_copy_tile<K>(input_cb_id, dst_base, 0, active_elements);
+    input_cb.pop_front(tiles);
+}
+
+// Sort half of topk_large_indices::process_chunk. FUSED_E2E stamps the
+// runtime chunk id and stays fused (one global split per row at the end);
+// the classic path splits to unfused per chunk (see compute.cpp).
+template <uint32_t K>
+FORCE_INLINE void finish_chunk_only(uint32_t dst_base, bool ascending, uint32_t chunk_id) {
+    topk_xl_add_lsb_indices_init();
+#ifdef FUSED_E2E
+    topk_xl_add_lsb_indices_rt<K>(dst_base, chunk_id);
+
+    topk_xl_init<K, true>();
+    topk_xl_local_sort<K>(dst_base, ascending);
+#else
+    (void)chunk_id;
+    topk_xl_add_lsb_indices<K, 0>(dst_base);
+
+    topk_xl_init<K, true>();
+    topk_xl_local_sort<K>(dst_base, ascending);
+
+    topk_xl_separate_indices_row_major_reinit();
+    topk_xl_separate_indices_row_major<K>(dst_base);
+    topk_xl_separate_indices_row_major_advance_chunk_base<K>();
+#endif
+}
+
+#ifdef FUSED_SEGMENTED
+// Segment-local fused finish: runtime stamp of the segment-LOCAL chunk id
+// (see compute.cpp's segmented body).
+template <uint32_t K>
+FORCE_INLINE void finish_chunk_fused_local(uint32_t dst_base, bool ascending, uint32_t local_id) {
+    topk_xl_add_lsb_indices_init();
+    topk_xl_add_lsb_indices_rt<K>(dst_base, local_id);
+
+    topk_xl_init<K, true>();
+    topk_xl_local_sort<K>(dst_base, ascending);
+}
+#endif
+
+}  // namespace
+
+void kernel_main() {
+    using namespace topk_large_indices;
+
+    const uint32_t num_rows = get_arg_val<uint32_t>(0);
+    const uint32_t num_chunks = get_arg_val<uint32_t>(1);
+    const uint32_t tail_elements = get_arg_val<uint32_t>(2);
+
+    constexpr uint32_t input_cb = get_compile_time_arg_val(0);
+    constexpr uint32_t indices_cb = get_compile_time_arg_val(1);
+    constexpr uint32_t K = get_compile_time_arg_val(2);
+    constexpr uint32_t values_cb = get_compile_time_arg_val(3);
+    constexpr uint32_t USER_K = get_compile_time_arg_val(4);
+
+    static_assert(K == 512 || K == 1024 || K == 2048, "K must be 512, 1024, or 2048");
+    constexpr uint32_t tiles_per_sequence = (K + elements_per_tile - 1) / elements_per_tile;
+    constexpr uint32_t sequence_tiles = tiles_per_sequence * 2u;
+    constexpr uint32_t slot0 = 0;
+#ifdef FUSED_SEGMENTED
+    constexpr uint32_t slotA = sequence_tiles;  // in-flight fused segment (see compute.cpp)
+#endif
+#ifdef FUSED_E2E
+    constexpr uint32_t slot1 = tiles_per_sequence;  // fused survivor is half-width (see compute.cpp)
+#else
+    constexpr uint32_t slot1 = sequence_tiles;
+#endif
+
+    namespace skip = topk_large_indices_chunk_skip;
+
+    compute_kernel_hw_startup(input_cb, indices_cb);
+    if constexpr (kChunkSkipEnable) {
+        skip::chunk_skip_configure();
+    }
+
+    CircularBuffer input_cb_obj(input_cb);
+    CircularBuffer indices_cb_obj(indices_cb);
+    CircularBuffer values_cb_obj(values_cb);
+
+    for (uint32_t row = 0; row < num_rows; ++row) {
+        tile_regs_acquire();
+#ifdef CHUNK_SKIP_TELEMETRY
+        skip::telemetry_row_begin(num_chunks);
+#endif
+
+#ifdef FUSED_SEGMENTED
+        // Segmented fusion; identical structure to compute.cpp's segmented
+        // body (see the comments there), using this kernel's chunk helpers.
+        constexpr uint32_t seg_cap = 32;
+        const uint32_t num_segments = (num_chunks + seg_cap - 1) / seg_cap;
+        for (uint32_t seg = 0; seg < num_segments; ++seg) {
+            const uint32_t seg_first = seg * seg_cap;
+            const uint32_t seg_end = (seg_first + seg_cap < num_chunks) ? (seg_first + seg_cap) : num_chunks;
+            const uint32_t seg_last = seg_end - 1;
+            const uint32_t base = (seg == 0) ? slot0 : slotA;
+            const uint32_t chunkslot = base + tiles_per_sequence;
+            const bool mirror_last = (seg != 0);
+
+            // No index-tracking clear is needed after the unfused
+            // cross-segment fold: every fused chunk's add_lsb_indices_init /
+            // topk_xl_init<K, true> resets the whole SFPU LaneConfig register
+            // (_init_sfpu_config_reg writes 0), so the unfused init's
+            // index-tracking bit never survives into fused work.
+
+            const uint32_t first_elems = (seg_first + 1 == num_chunks) ? tail_elements : K;
+            copy_chunk_only<K>(input_cb_obj, base, first_elems);
+            finish_chunk_fused_local<K>(base, false, 0);
+            if (seg_first == seg_last) {
+                topk_xl_rebuild<K, true>(base, mirror_last);
+            }
+            for (uint32_t chunk = seg_first + 1; chunk <= seg_last; ++chunk) {
+                const uint32_t active_elements = (chunk + 1 == num_chunks) ? tail_elements : K;
+                copy_chunk_only<K>(input_cb_obj, chunkslot, active_elements);
+                finish_chunk_fused_local<K>(chunkslot, true, chunk - seg_first);
+                topk_xl_merge<K, true>(base);
+                topk_xl_rebuild<K, true>(base, mirror_last && (chunk == seg_last));
+            }
+
+            topk_xl_separate_indices_row_major_global_init();
+            topk_xl_separate_indices_row_major_global_base<K>(base, seg * (seg_cap * K));
+
+            if (seg != 0) {
+                topk_xl_init<K, false>();
+                topk_xl_merge<K, false>(slot0);
+                topk_xl_rebuild<K, false>(slot0, false);
+            }
+        }
+#else
+#ifndef FUSED_E2E
+        topk_xl_separate_indices_row_major_init_static<0, 0>();
+#endif
+
+        const uint32_t first_chunk_elements = (num_chunks == 1) ? tail_elements : K;
+        copy_chunk_only<K>(input_cb_obj, slot0, first_chunk_elements);
+        finish_chunk_only<K>(slot0, false, 0);
+
+        if (num_chunks == 1) {
+#ifdef FUSED_E2E
+            topk_xl_rebuild<K, true>(slot0, false);
+#else
+            topk_xl_init<K, false>();
+            topk_xl_rebuild<K, false>(slot0, false);
+#endif
+        }
+
+        for (uint32_t chunk = 1; chunk < num_chunks; ++chunk) {
+            const uint32_t active_elements = (chunk + 1 == num_chunks) ? tail_elements : K;
+            copy_chunk_only<K>(input_cb_obj, slot1, active_elements);
+
+#ifndef FUSED_E2E
+            // Chunk skip is a classic-path feature (unfused DST layout).
+            if constexpr (kChunkSkipEnable) {
+#ifdef CHUNK_SKIP_TELEMETRY
+                // Telemetry variant: identical gate predicate and identical
+                // per-chunk mailbox traffic on every TRISC (see compute.cpp).
+                if (chunk >= skip::first_tested_chunk<USER_K>()) {
+                    const bool skipped = skip::chunk_skip_decide<K, USER_K>(slot1);
+                    skip::telemetry_record(chunk, skipped);
+                    if (skipped) {
+                        topk_xl_separate_indices_row_major_advance_chunk_base<K>();
+                        continue;
+                    }
+                }
+#else
+                if (chunk >= skip::first_tested_chunk<USER_K>() && skip::chunk_skip_decide<K, USER_K>(slot1)) {
+                    topk_xl_separate_indices_row_major_advance_chunk_base<K>();
+                    continue;
+                }
+#endif
+            }
+#endif
+
+            finish_chunk_only<K>(slot1, true, chunk);
+
+#ifdef FUSED_E2E
+            topk_xl_merge<K, true>(slot0);
+            topk_xl_rebuild<K, true>(slot0, false);
+#else
+            topk_xl_init<K, false>();
+            topk_xl_merge<K, false>(slot0);
+            topk_xl_rebuild<K, false>(slot0, false);
+#endif
+        }
+#ifdef CHUNK_SKIP_TELEMETRY
+        skip::telemetry_row_end<USER_K>(row, num_chunks);
+#endif
+
+#ifdef FUSED_E2E
+        topk_xl_separate_indices_row_major_global_init();
+        topk_xl_separate_indices_row_major_global<K>(slot0);
+#endif
+#endif  // FUSED_SEGMENTED
+#ifndef TOPK_SKIP_NEGINF_SENTINEL
+        mark_neginf_indices<K>(slot0);
+#endif
+        materialize_index_rank_order<K>(slot0, indices_cb);
+        materialize_values_rank_order<K>(slot0);
+
+        tile_regs_commit();
+        tile_regs_wait();
+
+        values_cb_obj.reserve_back(1);
+        pack_untilize_dest_init<tiles_per_sequence, tiles_per_sequence>(values_cb);
+        pack_untilize_dest<tiles_per_sequence, tiles_per_sequence>(values_cb, 1, 0, slot0);
+        values_cb_obj.push_back(1);
+
+        indices_cb_obj.reserve_back(1);
+        pack_untilize_dest_init<tiles_per_sequence, tiles_per_sequence>(indices_cb);
+        pack_untilize_dest<tiles_per_sequence, tiles_per_sequence>(indices_cb, 1, 0, slot0 + tiles_per_sequence);
+        indices_cb_obj.push_back(1);
+
+        tile_regs_release();
+    }
+}
